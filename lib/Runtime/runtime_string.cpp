@@ -351,6 +351,22 @@ const char* dragon_str_intern(const char* utf8_bytes, int64_t byte_len) {
     return data;
 }
 
+/// PRomote a heap string to immortal (refcount staturated), so incref/decref
+/// becomes no-ops on it forever. Codegen calls this on a module-global whose
+/// value is a program-lifetime constant. The HTTP server multiplexes handlers
+/// across a POOL of OS worker threads, and Dragon's default refcount is
+/// not atomic, so a shared global with a live refcount races (concurrent
+/// incref/decref -> torn count -> premature free -> use-after-free). An immortal
+/// never touches its refcount, so concurrent reads are safe with zero synchronization.
+/// No-op on a string literal (no header) or an already-immortal STRING. This does not
+/// make a MUTABLE shared object thread-safe - only its refcount; use a pool/lock for
+/// objects whose contents mutate.
+void dragon_str_make_immortal(const char* s) {
+    if (!s || !dragon_is_heap_string(s)) return;
+    DragonString* ds = dragon_string_from_data(s);
+    ds->header.refcount = DRAGON_IMMORTAL_REFCOUNT;
+}
+
 // Forward decl - defined further below alongside the refcount helpers.
 // Forward decl for the kind-aware substring scan (used by replace).
 static int64_t dragon_str_find_cp(const char* haystack, const char* needle, int64_t start);

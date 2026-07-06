@@ -1140,6 +1140,10 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // void dragon_decref_str(ptr data) -- string-specific (data -> header)
     getOrDeclareRuntime("dragon_decref_str",
         llvm::FunctionType::get(voidType, {i8PtrType}, false));
+    // void dragon_str_make_immortal(ptr data) -- saturate a module-global const
+    // string's refcount so a cross-worker-thread read never races on it.
+    getOrDeclareRuntime("dragon_str_make_immortal",
+        llvm::FunctionType::get(voidType, {i8PtrType}, false));
     // void dragon_incref_callable(ptr) / dragon_decref_callable(ptr)
     //  Tag-aware RC for `Callable[[...], R]` field slots: a Callable
     //  field can hold either a bare LLVM fn pointer (no header, no RC) or

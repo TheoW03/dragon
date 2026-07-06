@@ -1032,6 +1032,22 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     impl_->storeWithRCOverwrite(
                         gv, gv->getValueType(), val, oldKind, varKind, rhsBorrowed, name->name);
                 }
+                // A module-global str constant is program-lifetime and is read from the http server's os
+                // worker threads. Dragons's default refcount is non-atomic, so a shared global with a live
+                // frecount races. Concurrent incref/decref tears the count, the string is freed early and
+                // anotherworker reads freed memory (heap use after free / `unaligned tcache chunk`).
+                // Promote the stored value to immortal so coros-thread reads never touch its
+                // refcount - lock-free and zero-cost. Gated to a string-literal
+                // RHS: provably constant and never needs freeing, so immortality
+                // introduces no leak even if the global is later re-assigned.
+                if (impl_->options.gcMode == GCMode::RC &&
+                    varKind == Impl::VarKind::Str &&
+                    dynamic_cast<StringLiteral*>(node.value.get())) {
+                    auto* stored = impl_->builder->CreateLoad(
+                        gv->getValueType(), gv, name->name + ".imm");
+                    impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_str_make_immortal"], {stored});
+                }
             }
             // GV is already zero-initialized by its initializer (no explicit store needed for default)
 
