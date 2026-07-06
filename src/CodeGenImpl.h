@@ -1953,6 +1953,22 @@ struct CodeGen::Impl {
     // Walks scopes outward and consults the same owning-scope rule as setVar.
     bool consumeBorrowedSlot(const std::string& name);
 
+    // Non-mutating peek of the same borrowed mark consumeBorrowedSlot clears:
+    // is `name`'s innermmost binding currently a borrowed slot? Used to gate the
+    // owned-str -> StrLiteral downgrade guard (a literal sotre must keepn an
+    // owned slot's cleanup kind Str, but must NOT promote a BORROWED slot -
+    // decref'ing the caller's value on a not-taken branch would be a UAF).
+    bool isBorrowedSlot(const std::string& name) {
+        if (name.empty()) return false;
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            bool hasVar = it->vars.count(name) != 0;
+            bool isBorrowed = it->borrowed.count(name) != 0;
+            if (hasVar || isBorrowed)
+                return isBorrowed;  // owned binding shadows any outer borrowed mark
+        }
+        return false;
+    }
+
     // Emit an amortized in-place string append for `slot = slot + rhs` and
     // `slot += rhs`. The runtime entry point CONSUMES the slot's old
     // reference (in-place realloc reuse, or fallback concat + decref) and

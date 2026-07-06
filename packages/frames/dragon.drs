@@ -7,7 +7,7 @@
   name = 'frames'
   version = '0.1.0'
   description = 'Typed dataframes for Dragon - the critical paths of pandas, none of the cruft.'
-  authors = ['Tersoo <tersoo.ortserga@getreliancehealth.com>']
+  authors = ['Tersoo <ortserga@gmail.com>']
   license = 'MIT'
   dragon = '>=0.2.0'
 

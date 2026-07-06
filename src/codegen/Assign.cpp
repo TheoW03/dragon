@@ -1395,6 +1395,21 @@ void CodeGen::visit(AssignStmt& node) {
                 ? impl_->lookupVarKind(name->name)
                 : Impl::VarKind::Other;
             Impl::VarKind newKind = inferIncomingKind(val);
+            // Mixed owned/literal slot: a string LITERAL stored into a slot that alreadly
+            // holds an woned heap string must not downgrade the slot's clearup kind to
+            // StrLiteral. Scope cleanup keys off the single compile-time varKind
+            // (emitScopeCleanupFor), so a downgrade makes it skip the decref, leaking the
+            // owned value that reaches cleanup on a branch where the literal store did not
+            // run (e.g. `p = dsn[7:]; if p == "" { p = ":memory:" }`). Keep the slot
+            // Str: dragon_decref_str is a safe no-op on the literal branch (it skips non-heap strings).
+            // Gated on !isBorrowedSlot: a BORROWED slot conditionally overwritten
+            // by a literal must stay StrLiteral (skip cleanup) - decref'ing the
+            // caller's borrowed value on the not-taken branch would be a UAF.
+            if (newKind == Impl::VarKind::StrLiteral &&
+                oldKind == Impl::VarKind::Str &&
+                !impl_->isBorrowedSlot(name->name)) {
+                newKind = Impl::VarKind::Str;
+            }
             // When the RHS box was unboxed into a native HEAP slot (str/list/dict),
             // `val` is now a bare `inttoptr` payload - NOT a tagged box. But
             // inferIncomingKind read the SOURCE variable's kind: for `ver = anyVar`

@@ -1,3 +1,4 @@
+"""
 # frames.dr - typed dataframes for Dragon
 #
 # Design (the "pandas without the cruft" core):
@@ -12,6 +13,7 @@
 #
 # Pure Dragon. Reductions (`sum`/`mean`/`min`/`max`/`std`) return float for a
 # uniform typed API regardless of int vs float column.
+"""
 
 from csv import parse_rows, format_row
 from math import sqrt
@@ -33,6 +35,7 @@ def dtype_name(dt: int) -> str {
     elif dt == DT_FLOAT { return "float" }
     return "str"
 }
+
 
 #===----------------------------------------------------------------------===#
 # Series - one typed column
