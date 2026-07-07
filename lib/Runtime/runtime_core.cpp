@@ -1108,6 +1108,12 @@ static void shared_walk_list(DragonList* l, DragonSharedWorklist* w) {
             int64_t v = dragon_list_load(l, i);
             if (v) dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)v);
         }
+    } else if (tag == DRAGON_TAG_CLOSURE) {
+        // list[Callable]: tag-gated (element may be a bare fn pointer).
+        for (int64_t i = 0; i < l->size; i++) {
+            int64_t v = dragon_list_load(l, i);
+            if (v) dragon_mark_shared_callable(w, (void*)(uintptr_t)v);
+        }
     }
 }
 
@@ -1121,6 +1127,8 @@ static void shared_walk_dict(DragonDict* d, DragonSharedWorklist* w) {
             if (tag == TAG_STR) dragon_mark_shared_str((const char*)(uintptr_t)v);
             else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)
                 dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)v);
+            else if (tag == DRAGON_TAG_CLOSURE)
+                dragon_mark_shared_callable(w, (void*)(uintptr_t)v);
         }
         // Keys are DragonStrings ONLY when keys_are_ptr == 1. An int-keyed
         // dict stores the i64 key cast into the pointer slot (see the
@@ -1142,6 +1150,8 @@ static void shared_walk_tuple(DragonTuple* t, DragonSharedWorklist* w) {
             if (tag == TAG_STR) dragon_mark_shared_str((const char*)(uintptr_t)v);
             else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)
                 dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)v);
+            else if (tag == DRAGON_TAG_CLOSURE)
+                dragon_mark_shared_callable(w, (void*)(uintptr_t)v);
         }
     }
 }
@@ -1159,6 +1169,8 @@ static void shared_walk_list_box(DragonListBox* l, DragonSharedWorklist* w) {
         if (tag == TAG_STR) dragon_mark_shared_str((const char*)(uintptr_t)v);
         else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)
             dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)v);
+        else if (tag == DRAGON_TAG_CLOSURE)
+            dragon_mark_shared_callable(w, (void*)(uintptr_t)v);
     }
 }
 
@@ -1174,6 +1186,38 @@ static void shared_walk_set(DragonSet* s, DragonSharedWorklist* w) {
             if (s->states[i] == 1 && s->buckets[i])
                 dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)s->buckets[i]);
     }
+}
+
+// Deque elements live in circular window [head, head+size); the elem_tag drives dispatch
+// exactly like the list walker. Previously a shared global deque's elements were never
+// marked (a gap), so reading one out of a handler infrefed an unmarked object
+// (the same torn-refcount class the list/dict walkers close)
+static void shared_walk_deque(DragonDeque* d, DragonSharedWorklist* w) {
+    if (!d || !d->data || d->size == 0) return;
+    uint8_t tag = d->elem_tag;
+    for (int64_t i = 0; i < d->size; i++) {
+        int64_t v = d->data[(d->head + i) % d->capacity];
+        if (!v) continue;
+        if (tag == TAG_STR) dragon_mark_shared_str((const char*)(uintptr_t)v);
+        else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)
+            dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)v);
+        else if (tag == DRAGON_TAG_CLOSURE)
+            dragon_mark_shared_callable(w, (void*)(uintptr_t)v);
+    }
+}
+
+void dragon_mark_shared_cell(void* worklist, void* cellPtr) {
+    if (!cellPtr) return;
+    DragonCell* c = (DragonCell*)cellPtr;
+    if (c->header.type_tag != DRAGON_TAG_CELL) return;
+    __atomic_fetch_or(&c->header.gc_flags, GC_FLAG_SHARED, __ATOMIC_RELAXED);
+    if (!c->holds_heap || !c->value) return;
+    if (c->kind == TAG_STR)
+        dragon_mark_shared_str((const char*)(intptr_t)c->value);
+    else if (c->kind == DRAGON_TAG_CLOSURE)
+        dragon_mark_shared_callable(worklist, (void*)(intptr_t)c->value);
+    else
+        dragon_mark_shared_worklist_push(worklist, (void*)(intptr_t)c->value);
 }
 
 void dragon_mark_shared_deep(void* obj) {
@@ -1202,7 +1246,33 @@ void dragon_mark_shared_deep(void* obj) {
                     __class_mark_shared_table[cid](cur, &w);
                 break;
             }
-            // Strings, bytes, generators, types, closures: leaves for SHARED
+            case DRAGON_TAG_DEQUE:
+                shared_walk_deque((DragonDeque*)cur, &w);
+                break;
+            // A closure's captures live in its env; walk them via the
+            // codegen-emitted gc_fn (DRAGON_ENV_OP_MARK_SHARED visits every
+            // heap capture, strings included - the cycle TRAVERSE op skips
+            // strings, so it cannot be reused here). Previously a gap: a
+            // shared closure's captured str/list read inside a handler
+            // increfed an unmarked object.
+            case DRAGON_TAG_CLOSURE: {
+                DragonClosure* cl = (DragonClosure*)cur;
+                DragonEnv* env = cl->env;
+                if (env) {
+                    uint8_t prev = (uint8_t)__atomic_fetch_or(
+                        &env->header.gc_flags, GC_FLAG_SHARED, __ATOMIC_RELAXED);
+                    if (!(prev & GC_FLAG_SHARED) && env->gc_fn)
+                        env->gc_fn(env, DRAGON_ENV_OP_MARK_SHARED, nullptr, &w);
+                }
+                break;
+            }
+            case DRAGON_TAG_ENV: {
+                DragonEnv* env = (DragonEnv*)cur;
+                if (env->gc_fn)
+                    env->gc_fn(env, DRAGON_ENV_OP_MARK_SHARED, nullptr, &w);
+                break;
+            }
+            // Strings, bytes, generators, types: leaves for SHARED
             // propagation (no heap children to mark).
             default: break;
         }
@@ -1226,7 +1296,9 @@ void dragon_mark_shared_boxed(int64_t tag, int64_t payload) {
     if (tag == DRAGON_TAG_CLOSURE) {
         DragonObjectHeader* h = (DragonObjectHeader*)(uintptr_t)payload;
         if (h->type_tag != DRAGON_TAG_CLOSURE) return;  // bare fn ptr: no-op
-        dragon_mark_shared(h);
+        // Deep, not single: the closure's env captures must be marked too
+        // (mark_shared_deep's TAG_CLOSURE case walks them via the env gc_fn).
+        dragon_mark_shared_deep(h);
         return;
     }
     if (tag >= TAG_LIST) dragon_mark_shared_deep((void*)(uintptr_t)payload);

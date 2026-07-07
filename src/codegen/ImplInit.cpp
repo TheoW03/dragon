@@ -1211,6 +1211,10 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // clsure / deep or header carrying hepa tags)
     getOrDeclareRuntime("dragon_mark_shared_boxed",
         llvm::FunctionType::get(voidType, {i64Type, i64Type}, false));
+    // void dragon_mark_shared_cell(ptr worklist, ptr cell) -- mark a captured
+    // DragonCell + its held value (tag-dispatched via the cell's kind)
+    getOrDeclareRuntime("dragon_mark_shared_cell",
+        llvm::FunctionType::get(voidType, {i8PtrType, i8PtrType}, false));
 
     // --- GC Phase 5: cycle collector integration ---
     // i64 dragon_class_register_dealloc(ptr fn) -- returns class_id

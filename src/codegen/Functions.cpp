@@ -42,12 +42,14 @@ llvm::Function* CodeGen::Impl::emitEnvGcFn(
     auto* deallocBB  = llvm::BasicBlock::Create(*context, "op.dealloc", gcFn);
     auto* traverseBB = llvm::BasicBlock::Create(*context, "op.traverse", gcFn);
     auto* clearBB    = llvm::BasicBlock::Create(*context, "op.clear", gcFn);
+    auto* markBB     = llvm::BasicBlock::Create(*context, "op.markshared", gcFn); 
     auto* retBB      = llvm::BasicBlock::Create(*context, "op.ret", gcFn);
 
-    auto* sw = builder->CreateSwitch(opArg, retBB, 3);
+    auto* sw = builder->CreateSwitch(opArg, retBB, 4);
     sw->addCase(llvm::ConstantInt::get(i32Ty, 0 /*DEALLOC*/),  deallocBB);
     sw->addCase(llvm::ConstantInt::get(i32Ty, 1 /*TRAVERSE*/), traverseBB);
     sw->addCase(llvm::ConstantInt::get(i32Ty, 2 /*CLEAR*/),    clearBB);
+    sw->addCase(llvm::ConstantInt::get(i32Ty, 3 /*MARK_SHARED*/), markBB);
 
     auto* visitFnPtrType = llvm::FunctionType::get(
         voidType, {i8PtrType, i8PtrType}, false);
@@ -110,6 +112,30 @@ llvm::Function* CodeGen::Impl::emitEnvGcFn(
                 llvm::Constant::getNullValue(
                     envStructType->getElementType((unsigned)(i + 1))),
                 pr.first);
+        }
+    }
+    builder->CreateRetVoid();
+
+    // Propagate the SHARED flag into every heap capture - str included
+    // (TRAVERSE skips them: they cannot close a cycle, but a capture read out
+    // of shared closure increfs, so it must be marked or refcount tears cross-thread)
+    builder->SetInsertPoint(markBB);
+    for (size_t i = 0; i < caps.size(); i++) {
+        if (!(caps[i].isCellRelay || isHeapKind(caps[i].kind))) continue;
+        auto pr = loadCapPtr(i);
+        if (caps[i].isCellRelay) {
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_cell"],
+                                {dataArg, pr.second});
+        } else if (caps[i].kind == VarKind::Str) {
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_str"],
+                                {pr.second});
+        } else if (caps[i].kind == VarKind::Closure) {
+            // Tag-gated: a Callable capture may be a bare fn pointer.
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_callable"],
+                                {dataArg, pr.second});
+        } else {
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_worklist_push"],
+                                {dataArg, pr.second});
         }
     }
     builder->CreateRetVoid();

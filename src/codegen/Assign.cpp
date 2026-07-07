@@ -700,6 +700,9 @@ void CodeGen::visit(AssignStmt& node) {
                                     impl_->builder->CreateCall(
                                         impl_->runtimeFuncs["dragon_decref_callable"],
                                         {oldPtr});
+                                    // D018 field write barrier (Callable form)
+                                    impl_->emitFieldSharedBarrier(
+                                        objPtr, newPtr, Impl::VarKind::Closure);
                                     impl_->builder->CreateStore(storeVal, gep);
                                     continue;
                                 }
@@ -719,6 +722,9 @@ void CodeGen::visit(AssignStmt& node) {
                                 else if (fieldKind != Impl::VarKind::Other)
                                     newKind = fieldKind;
                                 bool rhsBorrowed = Impl::isBorrowedHeapExpr(node.value.get());
+                                // A heap value stored into a SHARED instance's field becomes
+                                // globally reachable - mark it (inline-gated on the object's SHARED bit).
+                                impl_->emitFieldSharedBarrier(objPtr, storeVal, fieldKind);
                                 impl_->storeWithRCOverwrite(
                                     gep, fieldType, storeVal, fieldKind, newKind, rhsBorrowed,
                                     className + "." + attrTarget->attribute);
@@ -942,24 +948,82 @@ void CodeGen::visit(AssignStmt& node) {
                     }
 
                     if (auto* nameTarget = dynamic_cast<NameExpr*>(tupleTarget->elements[i].get())) {
-                        auto* alloca = impl_->lookupVar(nameTarget->name);
-                        bool hadSlot = (alloca != nullptr);
-                        if (!alloca) {
-                            alloca = impl_->createEntryAlloca(
-                                impl_->currentFunction, nameTarget->name, slotTy);
-                            impl_->setVar(nameTarget->name, alloca, newKind);
+                        // MODULE-LEVEL unpack (`const a: T, b: U = f()` at the
+                        // top level): the targets are module globals - the type
+                        // checker registers them in module scope and accepts
+                        // cross-function references, so lowering them as
+                        // main-frame allocas (the old behavior) made codegen
+                        // reject the very programs the checker passed
+                        // ("Undefined variable: a" from another function).
+                        // Mirror the AnnAssign module-global path: a real
+                        // GlobalVariable + kind tracking + the D018 marking
+                        // (globals are reachable from every vthread by name).
+                        bool unpackModuleLevel =
+                            (impl_->currentFunction == impl_->mainFunction) &&
+                            (impl_->scopes.size() <= impl_->moduleBodyScopeDepth);
+                        if (unpackModuleLevel) {
+                            auto* gv = impl_->lookupModuleGlobal(nameTarget->name);
+                            Impl::VarKind oldKind = gv
+                                ? impl_->lookupVarKind(nameTarget->name)
+                                : Impl::VarKind::Other;
+                            if (!gv) {
+                                gv = new llvm::GlobalVariable(
+                                    *impl_->module, slotTy, /*isConstant=*/false,
+                                    llvm::GlobalValue::InternalLinkage,
+                                    llvm::Constant::getNullValue(slotTy),
+                                    "global." + nameTarget->name);
+                                impl_->moduleGlobals[nameTarget->name] = gv;
+                            }
+                            impl_->moduleGlobalKinds[nameTarget->name] = newKind;
+                            bool gborrowed = (slotTy == impl_->i8PtrType);
+                            impl_->storeWithRCOverwrite(
+                                gv, slotTy, elem, oldKind, newKind,
+                                /*newIsBorrowed=*/gborrowed, nameTarget->name);
+                            if (!elemClassName.empty()) {
+                                impl_->varClassNames[nameTarget->name] = elemClassName;
+                                impl_->varClassOwningModule[nameTarget->name] =
+                                    impl_->resolveClassOwningModule(elemClassName);
+                                if (impl_->options.gcMode == GCMode::RC)
+                                    impl_->moduleGlobalKinds[nameTarget->name] =
+                                        Impl::VarKind::ClassInstance;
+                            }
+                            // D018 completion, same rules as the AnnAssign
+                            // hook: const str -> immortal (never reassigned,
+                            // immutable leaf); everything else heap -> SHARED.
+                            if (impl_->options.gcMode == GCMode::RC &&
+                                slotTy == impl_->i8PtrType) {
+                                Impl::VarKind sk =
+                                    impl_->moduleGlobalKinds[nameTarget->name];
+                                if (sk == Impl::VarKind::Str) {
+                                    impl_->builder->CreateCall(
+                                        impl_->runtimeFuncs[node.isConst
+                                            ? "dragon_str_make_immortal"
+                                            : "dragon_mark_shared_str"],
+                                        {elem});
+                                } else {
+                                    impl_->emitMarkSharedGlobal(elem, sk);
+                                }
+                            }
+                        } else {
+                            auto* alloca = impl_->lookupVar(nameTarget->name);
+                            bool hadSlot = (alloca != nullptr);
+                            if (!alloca) {
+                                alloca = impl_->createEntryAlloca(
+                                    impl_->currentFunction, nameTarget->name, slotTy);
+                                impl_->setVar(nameTarget->name, alloca, newKind);
+                            }
+                            Impl::VarKind oldKind = hadSlot
+                                ? impl_->lookupVarKind(nameTarget->name)
+                                : Impl::VarKind::Other;
+                            // Heap elements come borrowed from the tuple/list get.
+                            bool borrowed = (slotTy == impl_->i8PtrType);
+                            impl_->storeWithRCOverwrite(
+                                alloca, slotTy, elem,
+                                oldKind, newKind, /*newIsBorrowed=*/borrowed,
+                                nameTarget->name);
+                            if (!elemClassName.empty())
+                                impl_->varClassNames[nameTarget->name] = elemClassName;
                         }
-                        Impl::VarKind oldKind = hadSlot
-                            ? impl_->lookupVarKind(nameTarget->name)
-                            : Impl::VarKind::Other;
-                        // Heap elements come borrowed from the tuple/list get.
-                        bool borrowed = (slotTy == impl_->i8PtrType);
-                        impl_->storeWithRCOverwrite(
-                            alloca, slotTy, elem,
-                            oldKind, newKind, /*newIsBorrowed=*/borrowed,
-                            nameTarget->name);
-                        if (!elemClassName.empty())
-                            impl_->varClassNames[nameTarget->name] = elemClassName;
                     }
                 }
                 // Each heap element above was increfed into its slot (scalars
@@ -1003,7 +1067,12 @@ void CodeGen::visit(AssignStmt& node) {
                     coerced = impl_->builder->CreateZExt(coerced, impl_->i64Type, "boolext");
                 else if (cellKind == Impl::VarKind::Float && coerced->getType() == impl_->i64Type)
                     coerced = impl_->builder->CreateSIToFP(coerced, impl_->f64Type, "i2f");
-                impl_->emitCellWrite(alloca, cellKind, coerced, name->name);
+                // Ownedness matters: `acc = acc + s` hands the cell an OWNED
+                // fresh concat (+1 already) - incref'ing it too leaked one
+                // string per nonlocal mutation. A borrowed RHS (name/field/
+                // element read) still gets the cell's own incref.
+                impl_->emitCellWrite(alloca, cellKind, coerced, name->name,
+                                     Impl::isBorrowedHeapExpr(node.value.get()));
                 continue;
             }
             auto* alloca = impl_->lookupVar(name->name);

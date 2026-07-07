@@ -136,6 +136,16 @@ bool CodeGen::generate(dragon::Module& entryModule,
             Impl::VarKind vk = ann->annotation
                 ? impl_->typeExprToKind(ann->annotation.get())
                 : Impl::VarKind::Int;
+            // Given the code -> `X: deque[T] = deque(...)`: the annotation lowers
+            // list-like, but the val is a real DragonDeque. Correct the kidn + "__Deque"
+            // tag here - method bodies compile before the module-body stmnt runs its own
+            // correction (AugAnnAssign), and a method reading the global would misroute
+            // len/pop through list path (reads the deque header as a list - wrong values,
+            // runaway allocation on append)
+            if (impl_->annAssignIsDeque(ann)) {
+                vk = Impl::VarKind::Deque;
+                impl_->varClassNames[name->name] = "__Deque";
+            }
 
             auto* gv = new llvm::GlobalVariable(
                 *impl_->module, gvType, /*isConstant=*/false,
@@ -164,6 +174,68 @@ bool CodeGen::generate(dragon::Module& entryModule,
     // Assign paths both reuse an existing moduleGlobals entry, so main() still
     // creates the global exactly once and initializes it in place.
     for (auto& stmt : entryModule.body) {
+        // Module-level UNPACK targets (`const a: T, b: U = f()`, an AssignStmt
+        // with a TupleExpr target) are module globals too - forward declare
+        // them from the checker-resolved element types so class methods can
+        // reference them (methods compile before the module body initializes
+        // the slots, the unpack lowering in Assign.cpp reuses these gvs).
+        if (auto* as = dynamic_cast<AssignStmt*>(stmt.get())) {
+            if (as->targets.size() == 1) {
+                if (auto* tup = dynamic_cast<TupleExpr*>(as->targets[0].get())) {
+                    auto elemType = [&](size_t i) -> std::shared_ptr<Type> {
+                        if (i < tup->elements.size() && tup->elements[i]->type)
+                            return tup->elements[i]->type;
+                        if (as->value && as->value->type) {
+                            if (auto* tt = dynamic_cast<TupleType*>(as->value->type.get()))
+                                if (i < tt->elementTypes.size())
+                                    return tt->elementTypes[i];
+                        }
+                        return nullptr;
+                    };
+                    for (size_t i = 0; i < tup->elements.size(); ++i) {
+                        auto* nm = dynamic_cast<NameExpr*>(tup->elements[i].get());
+                        if (!nm) continue;
+                        std::string ugvName = "global." + nm->name;
+                        if (impl_->module->getGlobalVariable(ugvName)) continue;
+                        llvm::Type* ugvType = impl_->i64Type;
+                        Impl::VarKind uvk = Impl::VarKind::Int;
+                        if (auto et = elemType(i)) {
+                            switch (et->kind()) {
+                                case Type::Kind::Float:
+                                    ugvType = impl_->f64Type;
+                                    uvk = Impl::VarKind::Float;
+                                    break;
+                                case Type::Kind::Bool:
+                                    ugvType = impl_->i1Type;
+                                    uvk = Impl::VarKind::Bool;
+                                    break;
+                                case Type::Kind::Str:
+                                case Type::Kind::Bytes:
+                                case Type::Kind::List:
+                                case Type::Kind::Dict:
+                                case Type::Kind::Set:
+                                case Type::Kind::Tuple:
+                                case Type::Kind::Instance:
+                                case Type::Kind::Ptr:
+                                    ugvType = impl_->i8PtrType;
+                                    uvk = Impl::typeKindToVarKind(et->kind());
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                        auto* ugv = new llvm::GlobalVariable(
+                            *impl_->module, ugvType, /*isConstant=*/false,
+                            llvm::GlobalValue::InternalLinkage,
+                            llvm::Constant::getNullValue(ugvType), ugvName);
+                        impl_->moduleGlobals[nm->name] = ugv;
+                        impl_->moduleGlobalKinds[nm->name] = uvk;
+                        impl_->entryGlobalsAwaitingInit.insert(nm->name);
+                    }
+                }
+            }
+            continue;
+        }
         auto* ann = dynamic_cast<AnnAssignStmt*>(stmt.get());
         if (!ann || !ann->target) continue;
         auto* name = dynamic_cast<NameExpr*>(ann->target.get());
@@ -178,6 +250,19 @@ bool CodeGen::generate(dragon::Module& entryModule,
         Impl::VarKind vk = ann->annotation
             ? impl_->typeExprToKind(ann->annotation.get())
             : Impl::VarKind::Int;
+        // Deque-kind correction - see the dep-module loop above.
+        if (impl_->annAssignIsDeque(ann)) {
+            vk = Impl::VarKind::Deque;
+            impl_->varClassNames[name->name] = "__Deque";
+        }
+        // Callable-typed global: register its signature now, for same ordering reason
+        // as deque correction - a class method calling `TAGGER(x)` compiles before module
+        // body registers the type, and untyped indirect call fallback it would take will
+        // not drain owned result temp (one leaked str per call site under LSan).
+        if (auto* cte = dynamic_cast<CallableTypeExpr*>(ann->annotation.get())) {
+            impl_->callableTypes[name->name] = impl_->callableTypeExprToFnType(cte);
+            vk = Impl::VarKind::Closure;
+        }
 
         auto* gv = new llvm::GlobalVariable(
             *impl_->module, gvType, /*isConstant=*/false,

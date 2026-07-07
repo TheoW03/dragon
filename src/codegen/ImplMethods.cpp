@@ -1274,14 +1274,19 @@ void CodeGen::Impl::emitScopeCleanupFor(Scope& scope) {
             // a single dragon_decref drops it (its dealloc path drops the
             // held heap value via the kind tag stored on the cell). Inner
             // scopes that captured the cell ptr from env are marked
-            // borrowed at env-load time and skip this cleanup.
+            // borrowed at env-load time and skip this cleanup
             if (scope.cellBacked.count(name)) {
                 auto* cellPtr = builder->CreateLoad(i8PtrType, alloca, name + ".cell.gc");
                 builder->CreateCall(runtimeFuncs["dragon_decref"], {cellPtr});
                 continue;
             }
             if (!isHeapKind(kind)) continue;
-            if (kind == VarKind::Union) {
+            // The slot's LLVM type is the ground truth: a 16-byte box slot MUST
+            // take the tag-dispatched decref no matter what the kind map says.
+            // Kind bookkeeping can drift (an `Any` local later tagged
+            // ClassInstance for member dispatch); loading `ptr` from a box
+            // slot reads the TAG word and dragon_decref(7) SEGVs at scope exit
+            if (kind == VarKind::Union || alloca->getAllocatedType() == boxType) {
                 // D030 Phase 4: load box, extract tag + payload, conditional
                 // decref based on runtime tag.
                 auto* box = builder->CreateLoad(boxType, alloca, name + ".box.gc");

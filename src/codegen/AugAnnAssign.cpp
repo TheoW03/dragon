@@ -863,6 +863,8 @@ void CodeGen::visit(AnnAssignStmt& node) {
                         if (auto* sl = dynamic_cast<StringLiteral*>(node.value.get()))
                             newKind = (sl->isBytes ? Impl::VarKind::List : Impl::VarKind::StrLiteral);
                         bool rhsBorrowed = Impl::isBorrowedHeapExpr(node.value.get());
+                        // Field write barrier - see the Assign.cpp twin
+                        impl_->emitFieldSharedBarrier(objPtr, val, fieldKind);
                         impl_->storeWithRCOverwrite(
                             gep, fieldType, val, fieldKind, newKind, rhsBorrowed,
                             className + "." + attrTarget->attribute);
@@ -1040,13 +1042,20 @@ void CodeGen::visit(AnnAssignStmt& node) {
                 impl_->varTypedDictClass[name->name] = typedDictClassName;
             }
 
-            // Track class name for instances
+            // Track class name for instances. The ClassInstance kind override
+            // is gated off BOX slots throughout: an `Any`-annotated global
+            // stores a 16-byte {tag, payload} box, and its kind must stay
+            // Union so the D018 marking hook below (and any RC handling)
+            // extracts the payload instead of misreading the tag word as a
+            // pointer - the same misclassification that SEGV'd Any-boxed
+            // LOCALS at scope exit.
+            bool globalIsBoxSlot = (gv->getValueType() == impl_->boxType);
             if (!annotClassName.empty()) {
                 impl_->varClassNames[name->name] = annotClassName;
                 impl_->varClassOwningModule[name->name] =
                     impl_->resolveClassOwningModule(annotClassName);
                 // GC Phase 3: mark module global as ClassInstance
-                if (impl_->options.gcMode == GCMode::RC)
+                if (impl_->options.gcMode == GCMode::RC && !globalIsBoxSlot)
                     impl_->moduleGlobalKinds[name->name] = Impl::VarKind::ClassInstance;
             } else if (node.value) {
                 if (auto* callVal = dynamic_cast<CallExpr*>(node.value.get())) {
@@ -1056,7 +1065,7 @@ void CodeGen::visit(AnnAssignStmt& node) {
                             impl_->varClassOwningModule[name->name] =
                                 impl_->resolveClassOwningModule(calleeName->name);
                             // GC Phase 3: mark module global as ClassInstance
-                            if (impl_->options.gcMode == GCMode::RC)
+                            if (impl_->options.gcMode == GCMode::RC && !globalIsBoxSlot)
                                 impl_->moduleGlobalKinds[name->name] = Impl::VarKind::ClassInstance;
                         }
                     }
@@ -1081,7 +1090,9 @@ void CodeGen::visit(AnnAssignStmt& node) {
                         if (owningMod.empty())
                             owningMod = impl_->resolveClassOwningModule(cls);
                         impl_->varClassOwningModule[name->name] = owningMod;
-                        if (impl_->options.gcMode == GCMode::RC && impl_->classNames.count(cls))
+                        // Same box-slot guard as above.
+                        if (impl_->options.gcMode == GCMode::RC &&
+                            impl_->classNames.count(cls) && !globalIsBoxSlot)
                             impl_->moduleGlobalKinds[name->name] = Impl::VarKind::ClassInstance;
                     }
                 }
@@ -1475,8 +1486,15 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     if (auto* calleeName = dynamic_cast<NameExpr*>(callVal->callee.get())) {
                         if (impl_->classNames.count(calleeName->name)) {
                             impl_->varClassNames[name->name] = calleeName->name;
-                            // GC Phase 3: set ClassInstance kind for scope-exit decref
-                            if (impl_->options.gcMode == GCMode::RC)
+                            // GC Phase 3: set ClassInstance kind for scope-exit
+                            // decref - but NEVER on a box slot. `p: Any =
+                            // Dog(...)` allocates a 16-byte {tag, payload} box;
+                            // its kind must stay Union so cleanup extracts the
+                            // payload. Overriding to ClassInstance made cleanup
+                            // load the first 8 bytes (the TAG, 7) as a pointer
+                            // and dragon_decref(7) SEGV'd at scope exit.
+                            if (impl_->options.gcMode == GCMode::RC &&
+                                alloca->getAllocatedType() != impl_->boxType)
                                 impl_->setVar(name->name, alloca, Impl::VarKind::ClassInstance);
                         }
                     }
@@ -1486,7 +1504,10 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     auto cls = impl_->resolveExprClassName(node.value.get());
                     if (!cls.empty()) {
                         impl_->varClassNames[name->name] = cls;
-                        if (impl_->options.gcMode == GCMode::RC && impl_->classNames.count(cls))
+                        // Same box-slot guard as above.
+                        if (impl_->options.gcMode == GCMode::RC &&
+                            impl_->classNames.count(cls) &&
+                            alloca->getAllocatedType() != impl_->boxType)
                             impl_->setVar(name->name, alloca, Impl::VarKind::ClassInstance);
                     }
                 }

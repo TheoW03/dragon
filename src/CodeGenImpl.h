@@ -1093,6 +1093,23 @@ struct CodeGen::Impl {
     // access). Returns "" if the expression is not a known class instance.
     std::string resolveExprClassName(Expr* expr);
 
+    /// Does this module level annotated declaration bind a DEQUE? True when
+    /// the annotation names deque (`X: deque[T]`) or the RHS is a deque(...)
+    /// ctor call.
+    static bool annAssignIsDeque(AnnAssignStmt* ann) {
+        if (!ann) return false;
+        if (auto* gt = dynamic_cast<GenericTypeExpr*>(ann->annotation.get())) {
+            if (auto* gb = dynamic_cast<NamedTypeExpr*>(gt->base.get()))
+                if (gb->name == "deque") return true;
+        } else if (auto* nt = dynamic_cast<NamedTypeExpr*>(ann->annotation.get())) {
+            if (nt->name == "deque") return true;
+        }
+        if (auto* cv = dynamic_cast<CallExpr*>(ann->value.get()))
+            if (auto* cn = dynamic_cast<NameExpr*>(cv->callee.get()))
+                return cn->name == "deque";
+        return false;
+    }
+
     /// Is `e` a receiver expression denoting the intrinsic Lock? Covers a
     /// tagged local/global (`lock.acquire()`, `with glock`) via varClassNames,
     /// AND a Lock-typed instance field (`self._lock.acquire()`,
@@ -1672,7 +1689,46 @@ struct CodeGen::Impl {
         }
     }
 
-    /// D018 completion: a value stored into a MODULE GLOBAL is reachable from
+    /// Storing a heap value into a shared isntance field makes it globally reachable
+    /// through that instance so itm must be shared-marked like the list/sdict store
+    /// barriers already do for elements. Previously a gap masked only by fire path
+    /// re-marking `self` per connection.
+    /// UNSHARED instance pays one byte load + predicted-untaken branch (the
+    /// SHARED bit lives at header offset 9); only genuinely shared instances
+    /// reach the runtime call
+    void emitFieldSharedBarrier(llvm::Value* objPtr, llvm::Value* val, VarKind kind) {
+        if (options.gcMode != GCMode::RC) return;
+        if (!isHeapKind(kind)) return;
+        if (!objPtr || !objPtr->getType()->isPointerTy()) return;
+        if (!val || !val->getType()->isPointerTy()) return;
+        auto* func = currentFunction;
+        auto* i8Ty = llvm::Type::getInt8Ty(*context);
+        auto* flagsPtr = builder->CreateInBoundsGEP(
+            i8Ty, objPtr, llvm::ConstantInt::get(i64Type, 9), "obj.gcflags.p");
+        auto* flags = builder->CreateLoad(i8Ty, flagsPtr, "obj.gcflags");
+        auto* sharedBit = builder->CreateAnd(
+            flags, llvm::ConstantInt::get(i8Ty, 0x04), "obj.shared.bit");
+        auto* isShared = builder->CreateICmpNE(
+            sharedBit, llvm::ConstantInt::get(i8Ty, 0), "obj.is.shared");
+        auto* markBB = llvm::BasicBlock::Create(*context, "fieldshr.mark", func);
+        auto* contBB = llvm::BasicBlock::Create(*context, "fieldshr.cont", func);
+        builder->CreateCondBr(isShared, markBB, contBB);
+        builder->SetInsertPoint(markBB);
+        if (kind == VarKind::Str) {
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_str"], {val});
+        } else if (kind == VarKind::Closure) {
+            // tag gated: a Callable field val may be a bare fn ptr.
+            auto* asI64 = builder->CreatePtrToInt(val, i64Type, "fieldshr.clos.i64");
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_boxed"],
+                {llvm::ConstantInt::get(i64Type, 10), asI64});
+        } else {
+            builder->CreateCall(runtimeFuncs["dragon_mark_shared_deep"], {val});
+        }
+        builder->CreateBr(contBB);
+        builder->SetInsertPoint(contBB);
+    }
+
+    /// A value stored into a MODULE GLOBAL is reachable from
     /// every vthread BY NAME - it never crosses a `fire` boundary, so the
     /// fire-site mark (emitAtomicIncref above) never sees it. Two handler
     /// vthreads on different OS workers then run plain non-atomic
@@ -1681,11 +1737,6 @@ struct CodeGen::Impl {
     /// stored graph SHARED at the global-store site instead; the SHARED store
     /// barriers in list/dict keep the invariant for values inserted later.
     /// Cold path: module globals are stored once at init / rarely reassigned.
-    ///
-    /// StrLiteral is not a heap kind (literal-backed, immortal-promoted), so
-    /// it falls out at isHeapKind. A Closure value can be a bare fn pointer
-    /// (code address, NO header) - route it through the tag-gated boxed
-    /// variant; mark_shared_deep would atomic-OR gc_flags into .text.
     void emitMarkSharedGlobal(llvm::Value* val, VarKind kind) {
         if (options.gcMode != GCMode::RC) return;
         if (!isHeapKind(kind)) return;
@@ -1943,16 +1994,24 @@ struct CodeGen::Impl {
         return cellI64ToNative(raw, kind);
     }
 
-    /// Write to a cell-backed local. `newVal` is at native type; caller has
-    /// NOT yet incref'd new (we do it). Decrefs the prior cell contents
-    /// returned by dragon_cell_set under the same kind, so the cell holds
-    /// a balanced +1 ref to the latest value at all times.
+    /// Write to a cell-backed local. `newVal` is at native type. When the
+    /// value is BORROWED (a name/field/element read - some other slot owns
+    /// it), the cell increfs to take its own reference; an OWNED fresh value
+    /// (a concat / call result) already carries the +1 the cell adopts.
+    /// Incref'ing an owned value too left every intermediate at refcount 2:
+    /// a `nonlocal` str accumulator (`acc = acc + s`) leaked one string PER
+    /// MUTATION (534KB per 1000 loop iterations under LSan). Decrefs the
+    /// prior cell contents returned by dragon_cell_set under the same kind,
+    /// so the cell holds a balanced +1 ref to the latest value at all times.
+    /// `newIsBorrowed` defaults to true (the incref side) - the safe side for
+    /// self-aliasing writes (`s = s`) and in-place aug-assign results.
     void emitCellWrite(llvm::AllocaInst* alloca, VarKind kind,
-                       llvm::Value* newVal, const std::string& name) {
+                       llvm::Value* newVal, const std::string& name,
+                       bool newIsBorrowed = true) {
         auto* cellPtr = builder->CreateLoad(i8PtrType, alloca, name + ".cell.w");
-        // Incref new before swap-in so a self-aliasing write (s = s) doesn't
-        // momentarily drop refcount to zero.
-        emitIncrefByKind(newVal, kind);
+        // Incref borrowed new before swap-in so a self-aliasing write (s = s)
+        // doesn't momentarily drop refcount to zero.
+        if (newIsBorrowed) emitIncrefByKind(newVal, kind);
         auto* newI64 = nativeToCellI64(newVal, kind);
         auto* oldI64 = builder->CreateCall(
             runtimeFuncs["dragon_cell_set"], {cellPtr, newI64}, name + ".old");

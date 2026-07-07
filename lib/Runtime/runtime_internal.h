@@ -560,6 +560,9 @@ struct DragonClassDescriptor {
 #define DRAGON_ENV_OP_DEALLOC  0
 #define DRAGON_ENV_OP_TRAVERSE 1
 #define DRAGON_ENV_OP_CLEAR    2
+// SHARED-mark every heap capture (str included - TRAVERSE deliberately sksips strings
+// since they cannot close a cycle, but SHARED propagation must reach them).
+#define DRAGON_ENV_OP_MARK_SHARED 3
 struct DragonEnv {
     DragonObjectHeader header;
     void (*gc_fn)(void* env, int32_t op, void (*visit)(void*, void*), void* arg);

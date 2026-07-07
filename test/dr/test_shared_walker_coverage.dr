@@ -1,0 +1,107 @@
+"""SHARED-mark walker coverage: deque elements, closure captures, cells
+
+Given the code below:
+
+    const TAGGER: Callable[[str], str] = make_tagger("pre-")
+    const JOBS: deque[str] = deque(["a", "b", "c"])
+
+Both globals are SHARED-marked at the store site so vthread handlers can
+read them without tearing refcounts. But the deep walker used to treat a
+DEQUE and a CLOSURE as leaves: the deque's ELEMENTS and the closure's
+CAPTURED values ("pre-" above) stayed unmarked, so a handler doing
+`TAGGER("x")` or `JOBS[0]`-style reads increfed an unmarked object - the
+same torn-refcount class the list/dict walkers already close.
+
+WHY the cycle collector's traverse could not simply be reused for
+closures: TRAVERSE deliberately skips string captures (a str can never
+close a cycle), but SHARED propagation must reach them - so the env gc_fn
+gained a dedicated MARK_SHARED op that visits every heap capture, strings
+included, plus the cell shells that relay `nonlocal` bindings.
+
+BEFORE: deque elements / closure captures / cell-held values stayed
+unmarked behind a marked parent. AFTER: dragon_mark_shared_deep walks
+deque windows, closure envs (via DRAGON_ENV_OP_MARK_SHARED), and cells
+
+This suite value-asserts those walks (marking runs at every global store,
+single-process too): a layout misread crashes here, and the values must
+survive the walk intact.
+
+One line: marking a graph now reaches everything a handler can reach
+"""
+
+from unittest import TestCase, main
+from collections import deque
+
+
+def make_tagger(prefix: str) -> Callable[[str], str] {
+    def tag(s: str) -> str {
+        return prefix + s
+    }
+    return tag
+}
+
+
+def make_counter() -> Callable[[], int] {
+    n: int = 0
+    def bump() -> int {
+        nonlocal n
+        n = n + 1
+        return n
+    }
+    return bump
+}
+
+
+def make_accum(seed: str) -> Callable[[str], str] {
+    acc: str = seed
+    def add(s: str) -> str {
+        nonlocal acc
+        acc = acc + s
+        return acc
+    }
+    return add
+}
+
+
+# Module globals: marked at store; the walker must traverse each shape
+const TAGGER: Callable[[str], str] = make_tagger("pre-")
+const COUNTER: Callable[[], int] = make_counter()
+const ACCUM: Callable[[str], str] = make_accum("s:")
+const JOBS: deque[str] = deque(["alpha", "beta", "gamma"])
+const NUMS: deque[int] = deque([10, 20, 30])
+
+
+class SharedWalkerCoverageTests(TestCase) {
+    def test_global_closure_str_capture_survives_marking() {
+        # The captured "pre-" was walked at store time; every call reads it
+        self.assertEqual(TAGGER("x"), "pre-x")
+        i: int = 0
+        while i < 1000 {
+            const r: str = TAGGER("y")
+            self.assertEqual(len(r), 5)
+            i = i + 1
+        }
+    }
+
+    def test_global_closure_cell_captures() {
+        # int cell (holds_heap = 0: the mark helper's early-out path)
+        self.assertEqual(COUNTER(), 1)
+        self.assertEqual(COUNTER(), 2)
+        # str cell (holds_heap = 1: the tag-dispatched mark path)
+        self.assertEqual(ACCUM("a"), "s:a")
+        self.assertEqual(ACCUM("b"), "s:ab")
+    }
+
+    def test_global_deque_elements_survive_marking() {
+        self.assertEqual(len(JOBS), 3)
+        const first: str = JOBS.popleft()
+        self.assertEqual(first, "alpha")
+        JOBS.append("delta")
+        self.assertEqual(len(JOBS), 3)
+        self.assertEqual(NUMS.pop(), 30)
+        self.assertEqual(len(NUMS), 2)
+    }
+}
+
+
+main([SharedWalkerCoverageTests()])

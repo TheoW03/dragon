@@ -1301,6 +1301,23 @@ void CodeGen::visit(CallExpr& node) {
     // Method calls: obj.method(args)
     if (auto* attr = dynamic_cast<AttributeExpr*>(node.callee.get())) {
         if (emitMethodCall(node, *attr)) return;
+        // Silent-drop hardening (#2: a silent fallback is a silent lie). No dispatch
+        // path claimed this method call, the old behaviour fell to the `lastValue = 0`
+        // stub below and emitted nothing - compiled program simply skipped the call
+        // (`self._lock.acquire()` locked nothing until the concurrent mutation detctor
+        // exposed it). A call codegen cannot resolve should compile error never no-op.
+        std::string recv = "<expression>";
+        if (auto* on = dynamic_cast<NameExpr*>(attr->object.get()))
+            recv = "'" + on->name + "'";
+        else if (auto* oa = dynamic_cast<AttributeExpr*>(attr->object.get()))
+            recv = "'" + oa->attribute + "'";
+        impl_->addError(
+            "cannot resolve method '" + attr->attribute + "' on receiver " +
+            recv + ": no codegen dispatch path matched, so the call would "
+            "have been silently dropped",
+            node.location());
+        impl_->lastValue = llvm::ConstantInt::get(impl_->i64Type, 0);
+        return;
     }
 
     // Call of a callable VALUE - the callee is a value-producing expression
