@@ -51,6 +51,9 @@ static void dragon_repr_dict(DragonStrBuf* out, DragonDict* d);
 static void dragon_repr_set(DragonStrBuf* out, DragonSet* s);
 static void dragon_repr_tuple(DragonStrBuf* out, DragonTuple* t);
 
+// Defined in runtime_builtins.cpp - class-id -> name for `<Name instance>`.
+extern "C" const char* dragon_instance_class_name(void* instance);
+
 // Append the repr of one element (carrying tag `tag`) to `out`.
 static void dragon_repr_value(DragonStrBuf* out, int64_t val, uint8_t tag) {
     switch (tag) {
@@ -83,6 +86,38 @@ static void dragon_repr_value(DragonStrBuf* out, int64_t val, uint8_t tag) {
             break;
         }
         case TAG_DICT: dragon_repr_dict(out, (DragonDict*)(uintptr_t)val); break;
+        case TAG_BYTES: {
+            // TAG_BYTES == TAG_CLASS: gate on the real header (see
+            // dragon_print_box_raw) - rendering an instance as fake bytes
+            // read out of bounds; rendering it as a bare int leaked nothing
+            // but lied. Bytes render b'..'; instances render <Name instance>.
+            DragonObjectHeader* h = (DragonObjectHeader*)(uintptr_t)val;
+            if (h && h->type_tag == DRAGON_TAG_BYTES) {
+                auto* bv = (DragonBytes*)h;
+                sb_puts(out, "b'");
+                for (int64_t bi = 0; bi < bv->len; bi++) {
+                    uint8_t c = bv->data[bi];
+                    char tmp[8];
+                    if (c >= 32 && c < 127 && c != '\\' && c != '\'') {
+                        tmp[0] = (char)c; tmp[1] = '\0';
+                    } else if (c == '\\') { snprintf(tmp, sizeof(tmp), "\\\\"); }
+                    else if (c == '\'')  { snprintf(tmp, sizeof(tmp), "\\'"); }
+                    else { snprintf(tmp, sizeof(tmp), "\\x%02x", c); }
+                    sb_puts(out, tmp);
+                }
+                sb_putc(out, '\'');
+            } else if (!h) {
+                sb_puts(out, "None");
+            } else {
+                const char* nm = dragon_instance_class_name((void*)h);
+                char tmp[96];
+                if (nm) snprintf(tmp, sizeof(tmp), "<%s instance>", nm);
+                else    snprintf(tmp, sizeof(tmp), "<object at 0x%llx>",
+                                 (unsigned long long)val);
+                sb_puts(out, tmp);
+            }
+            break;
+        }
         default: {  // TAG_INT and anything without a richer repr
             char tmp[32];
             snprintf(tmp, sizeof(tmp), "%ld", (long)val);
@@ -227,6 +262,12 @@ static void dragon_json_list(DragonStrBuf* out, DragonList* l);
 static void dragon_json_list_box(DragonStrBuf* out, DragonListBox* l);
 static void dragon_json_dict(DragonStrBuf* out, DragonDict* d);
 
+// Non-serializable value seen during dumps (bytes / class instance): the
+// message is recorded here and raised by dragon_json_dumps after the output
+// buffer is freed. thread_local: handler threads dumps concurrently.
+static thread_local const char* json_dumps_error = nullptr;
+static thread_local char json_dumps_error_buf[128];
+
 static void dragon_json_value(DragonStrBuf* out, int64_t val, uint8_t tag) {
     switch (tag) {
         case TAG_STR: dragon_json_escape(out, (const char*)(uintptr_t)val); break;
@@ -254,6 +295,25 @@ static void dragon_json_value(DragonStrBuf* out, int64_t val, uint8_t tag) {
             break;
         }
         case TAG_DICT: dragon_json_dict(out, (DragonDict*)(uintptr_t)val); break;
+        case TAG_BYTES: {
+            // Neither bytes nor class instances are JSON-serializable (Python
+            // parity: json.dumps(b'x') raises TypeError). TAG_BYTES ==
+            // TAG_CLASS, so gate on the header for the message. The error is
+            // RECORDED here and raised by dragon_json_dumps AFTER the
+            // DragonStrBuf is freed - raising mid-recursion would longjmp
+            // past the buffer and leak it on every failed dumps.
+            DragonObjectHeader* h = (DragonObjectHeader*)(uintptr_t)val;
+            const char* nm = nullptr;
+            if (h && h->type_tag != DRAGON_TAG_BYTES)
+                nm = dragon_instance_class_name((void*)h);
+            snprintf(json_dumps_error_buf, sizeof(json_dumps_error_buf),
+                     "TypeError: Object of type %s is not JSON serializable",
+                     (h && h->type_tag == DRAGON_TAG_BYTES) ? "bytes"
+                                                            : (nm ? nm : "object"));
+            json_dumps_error = json_dumps_error_buf;
+            sb_puts(out, "null");
+            break;
+        }
         default: {  // TAG_INT
             char tmp[32]; snprintf(tmp, sizeof(tmp), "%lld", (long long)val);
             sb_puts(out, tmp);
@@ -306,8 +366,18 @@ static void dragon_json_dict(DragonStrBuf* out, DragonDict* d) {
 extern "C" {
 /// Generic json.dumps(obj). `obj` arrives boxed (Any), so dispatch on its tag.
 const char* dragon_json_dumps(DragonBox box) {
+    json_dumps_error = nullptr;
     DragonStrBuf b; sb_init(&b);
     dragon_json_value(&b, box.payload, (uint8_t)box.tag);
+    if (json_dumps_error) {
+        // Free the buffer BEFORE raising - the raise longjmps to the handler
+        // (or exits) and never returns here.
+        free(b.buf);
+        const char* msg = json_dumps_error;
+        json_dumps_error = nullptr;
+        dragon_raise_exc_cstr(80, msg);
+        return dragon_string_alloc("", 0);  // unreachable
+    }
     const char* r = dragon_string_alloc(b.buf, (int64_t)b.len);
     free(b.buf);
     return r;
@@ -482,6 +552,14 @@ void dragon_tuple_destroy(DragonTuple* t) {
                 dragon_decref_str_dispatch((const char*)(uintptr_t)val);
             } else if (val && (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)) {
                 dragon_decref_dispatch((void*)(uintptr_t)val);
+            } else if (val && tag == DRAGON_TAG_CLOSURE) {
+                // AUDIT-2026-07-09 Tier 4: fill paths (tuple literals with
+                // Callable elements, dragon_tuple_from_list, dict items()/
+                // popitem()) all take a ref on tag-10 elements; without this
+                // arm every such tuple leaked the closure + its env. Tag-gated
+                // dragon_decref_callable no-ops on a bare fn ptr element
+                // (mirrors dragon_deque_destroy / dragon_dict_destroy).
+                dragon_decref_callable((void*)(uintptr_t)val);
             }
         }
     }
@@ -687,6 +765,11 @@ void dragon_set_remove(DragonSet* s, int64_t val) {
                 dragon_decref_str_dispatch((const char*)(uintptr_t)stored);
             else if (stored && (s->elem_tag == TAG_LIST || s->elem_tag == TAG_DICT || s->elem_tag == TAG_BYTES))
                 dragon_decref_dispatch((void*)(uintptr_t)stored);
+            else if (stored && s->elem_tag == DRAGON_TAG_CLOSURE)
+                // AUDIT-2026-07-09 Tier 4: dragon_set_add increfs tag-10
+                // elements via dragon_incref_tagged; the release paths must
+                // mirror it. Tag-gated (bare fn ptr safe).
+                dragon_decref_callable((void*)(uintptr_t)stored);
             return;
         }
         idx = (idx + 1) % s->capacity;
@@ -711,6 +794,9 @@ void dragon_set_discard(DragonSet* s, int64_t val) {
                 dragon_decref_str_dispatch((const char*)(uintptr_t)stored);
             else if (stored && (s->elem_tag == TAG_LIST || s->elem_tag == TAG_DICT || s->elem_tag == TAG_BYTES))
                 dragon_decref_dispatch((void*)(uintptr_t)stored);
+            else if (stored && s->elem_tag == DRAGON_TAG_CLOSURE)
+                // AUDIT-2026-07-09 Tier 4 - mirrors dragon_set_remove.
+                dragon_decref_callable((void*)(uintptr_t)stored);
             return;
         }
         idx = (idx + 1) % s->capacity;
@@ -727,7 +813,14 @@ void dragon_set_clear(DragonSet* s) {
         // Concurrent-mutation detector: whole teardown is the window; decrefs
         // stay inside (see dragon_dict_clear for the rationale).
         bool mut_armed = dragon_shared_mut_begin(&s->header, "set");
-        // Decref elements before clearing
+        // Decref elements before clearing.
+        // Non-dispatch decrefs are correct here (unlike the destroy path):
+        // clear() is a mutator-facing API only reachable from user code, never
+        // from an atomic-context dealloc chain (__dragon_atomic_context is set
+        // exclusively around dragon_dealloc inside dragon_decref_atomic, and no
+        // destroy/clear_refs path calls dragon_set_clear), and dragon_decref
+        // itself already routes SHARED objects to the atomic path. Verified
+        // AUDIT-2026-07-09 Tier 4; revisit if user finalizers (__del__) land.
         uint8_t tag = s->elem_tag;
         if (tag == TAG_STR) {
             for (int64_t i = 0; i < s->capacity; i++) {
@@ -738,6 +831,12 @@ void dragon_set_clear(DragonSet* s) {
             for (int64_t i = 0; i < s->capacity; i++) {
                 if (s->states[i] == 1 && s->buckets[i])
                     dragon_decref((void*)(uintptr_t)s->buckets[i]);
+            }
+        } else if (tag == DRAGON_TAG_CLOSURE) {
+            // AUDIT-2026-07-09 Tier 4 - mirrors dragon_set_remove/destroy.
+            for (int64_t i = 0; i < s->capacity; i++) {
+                if (s->states[i] == 1 && s->buckets[i])
+                    dragon_decref_callable((void*)(uintptr_t)s->buckets[i]);
             }
         }
         memset(s->states, 0, s->capacity);
@@ -763,6 +862,14 @@ DragonSet* dragon_set_copy(DragonSet* s) {
         for (int64_t i = 0; i < n->capacity; i++) {
             if (n->states[i] == 1 && n->buckets[i])
                 dragon_incref((void*)(uintptr_t)n->buckets[i]);
+        }
+    } else if (tag == DRAGON_TAG_CLOSURE) {
+        // Required inverse of the tag-10 arm in dragon_set_destroy (AUDIT
+        // 2026-07-09 Tier 4): a memcpy'd copy of a set[Callable] must co-own
+        // its closures or the two destroys would double-free them. Tag-gated.
+        for (int64_t i = 0; i < n->capacity; i++) {
+            if (n->states[i] == 1 && n->buckets[i])
+                dragon_incref_callable((void*)(uintptr_t)n->buckets[i]);
         }
     }
     return n;
@@ -897,6 +1004,15 @@ void dragon_set_destroy(DragonSet* s) {
         for (int64_t i = 0; i < s->capacity; i++) {
             if (s->states[i] == 1 && s->buckets[i])
                 dragon_decref_dispatch((void*)(uintptr_t)s->buckets[i]);
+        }
+    } else if (tag == DRAGON_TAG_CLOSURE) {
+        // AUDIT-2026-07-09 Tier 4: dragon_set_add / dragon_set_copy take a
+        // ref on tag-10 elements; without this arm every set[Callable] leaked
+        // its closures + envs on destroy. Tag-gated (bare fn ptr safe),
+        // mirrors dragon_deque_destroy.
+        for (int64_t i = 0; i < s->capacity; i++) {
+            if (s->states[i] == 1 && s->buckets[i])
+                dragon_decref_callable((void*)(uintptr_t)s->buckets[i]);
         }
     }
     free(s->buckets);
@@ -1494,6 +1610,17 @@ DragonDeque* dragon_deque_new(int64_t maxlen, int64_t elem_tag) {
 void dragon_deque_append(DragonDeque* d, int64_t value, int64_t tag) {
     if (tag) d->elem_tag = (uint8_t)tag;
     if (d->maxlen == 0) return;  // Python: maxlen-0 deque silently discards
+    // Acyclic-skip enrollment (AUDIT-2026-07-09 Tier 4: deques were NEVER
+    // gc-tracked, so a deque in a reference cycle leaked unconditionally).
+    // Mirrors the dict/tuple insert gates: enroll on the first traceable
+    // (list/dict/bytes/instance/closure) element, BEFORE the store, so a
+    // concurrent collector can never see the edge without the deque already
+    // being a root. elem_tag is refreshed per append, so the gate lives here
+    // (and in appendleft) rather than at construction.
+    if (value && dragon_value_tag_is_traceable((int8_t)d->elem_tag) &&
+        !(d->header.gc_flags & GC_FLAG_TRACKED)) {
+        dragon_gc_track(d);
+    }
     // Concurrent-mutation detector: no raise below; the bounded-eviction
     // decref stays inside (see dragon_dict_clear for the rationale).
     bool mut_armed = dragon_shared_mut_begin(&d->header, "deque");
@@ -1515,6 +1642,11 @@ void dragon_deque_append(DragonDeque* d, int64_t value, int64_t tag) {
 void dragon_deque_appendleft(DragonDeque* d, int64_t value, int64_t tag) {
     if (tag) d->elem_tag = (uint8_t)tag;
     if (d->maxlen == 0) return;
+    // Acyclic-skip enrollment - see dragon_deque_append
+    if (value && dragon_value_tag_is_traceable((int8_t)d->elem_tag) &&
+        !(d->header.gc_flags & GC_FLAG_TRACKED)) {
+        dragon_gc_track(d);
+    }
     // Concurrent-mutation detector - see dragon_deque_append.
     bool mut_armed = dragon_shared_mut_begin(&d->header, "deque");
     dragon_incref_tagged(value, d->elem_tag);

@@ -153,14 +153,17 @@ bool ListType::equals(const Type& other) const {
 
 bool ListType::isSubtypeOf(const Type& other) const {
     if (Type::isSubtypeOf(other)) return true;
-    // Covariance into list[Any] only: list[T] <: list[Any] for any T.
-    // Allows list literals of class values etc. to be assigned to list[type]
-    // (which resolves to list[Any]) without sacrificing list-invariance for
-    // non-Any element types like list[int] vs list[str].
-    if (other.kind() == Kind::List) {
-        auto& o = static_cast<const ListType&>(other);
-        if (o.elementType->kind() == Kind::Any) return true;
-    }
+    // Lists are INVARIANT in their element type - including against list[Any].
+    // list[T] and list[Any] have different runtime element layouts (a
+    // monomorphized 8B/elem native list vs the 16B/elem {tag, payload} box
+    // list), so letting a list[str] value FLOW as list[Any] is not just the
+    // usual mutable-container variance unsoundness - every element read
+    // through the list[Any] view walks the wrong stride (silent wrong values,
+    // OOB). A FRESH literal is still admitted covariantly by retyping it at
+    // the use site (tryExpectedTypeLiteral) so it is BUILT as a box list.
+    // Class-descriptor lists (`list[type]`, also resolving to list[Any]) are
+    // accepted at the annotated-assign sites, which can still see the `type`
+    // spelling in the annotation AST.
     return false;
 }
 
@@ -561,6 +564,52 @@ bool TypeChecker::check(Module& module) {
                     tryRegister(attr->attribute, ann->annotation.get());
             }
         }
+    }
+
+    // Function-signature pre-pass (mirrors the class pre-pass): register every
+    // module-level function's signature before any body is checked, so a
+    // forward reference (a method calling a module function defined further
+    // down the file) resolves AT its declared type. Without this the callee
+    // name silently typed Unknown (visit(NameExpr)'s fallback), the call
+    // result carried no static type, and every type-gated consumer went
+    // blind - concretely, ownedTempDrainKind skipped the owned-result drain
+    // and the returned string leaked once per call (the _encode_chunk family
+    // in stdlib/http/server.dr). Signatures that don't resolve cleanly here
+    // (e.g. a param typed by an import processed on the main walk) are rolled
+    // back and left for visit(FunctionDecl), which has full context and owns
+    // the real diagnostics. Generic templates stay with the D044 pre-pass;
+    // already-bound names (imports, builtins a function shadows) are skipped
+    // so main-walk order keeps deciding those.
+    for (auto& stmt : module.body) {
+        auto* fd = dynamic_cast<FunctionDecl*>(stmt.get());
+        if (!fd) continue;
+        if (!fd->typeParams.empty()) continue;
+        if (impl_->lookup(fd->name)) continue;
+        size_t diagBefore = impl_->diagnostics.size();
+        std::vector<std::shared_ptr<Type>> paramTypes;
+        bool clean = true;
+        for (auto& p : fd->params) {
+            if (fd->isMethod && !fd->hasImplicitSelf && p.name == "self")
+                continue;
+            auto pt = resolveType(p.type.get());
+            if (!pt || pt->kind() == Type::Kind::Unknown) clean = false;
+            paramTypes.push_back(pt);
+        }
+        auto retType = resolveType(fd->returnType.get());
+        if (fd->returnType && (!retType || retType->kind() == Type::Kind::Unknown))
+            clean = false;
+        if (impl_->diagnostics.size() > diagBefore) {
+            impl_->diagnostics.resize(diagBefore);
+            continue;
+        }
+        if (!clean) continue;
+        auto externalRet = fd->isAsync ? std::static_pointer_cast<Type>(
+                                             std::make_shared<TaskType>(retType))
+                                       : retType;
+        auto funcType = std::make_shared<FunctionType>(paramTypes, externalRet);
+        fillFuncMeta(*funcType, fd->params, fd->isMethod, fd->hasImplicitSelf,
+                     fd->isClassMethod);
+        impl_->define(fd->name, funcType);
     }
 
     module.accept(*this);
@@ -1006,6 +1055,73 @@ void TypeChecker::visit(NameExpr& node) {
     } else {
         // Name might be a builtin type name used as value (like True/False/None)
         node.type = impl_->unknownType;
+    }
+    // E11 (docs/002 2.7): dubability composes. A dub is a DEEP copy, so it
+    // only exists for types whose whole payload can honestly be copied:
+    // scalars trivially; str/bytes as identity retains (immutable); a
+    // container iff its elements are dubable. Raw resources, Any, closures,
+    // and class instances (v1) refuse with the reason.
+    if (node.isDubMarked && node.type) {
+        std::string why;
+        if (!typeIsDubable(node.type.get(), why))
+            error(node.location(),
+                  "'" + node.name + "' is not dubable: " + why);
+    }
+}
+
+bool TypeChecker::typeIsDubable(const Type* t, std::string& why) {
+    if (!t) { why = "its type is unknown"; return false; }
+    switch (t->kind()) {
+        case Type::Kind::Int:
+        case Type::Kind::Float:
+        case Type::Kind::Bool:
+        case Type::Kind::None_:
+        case Type::Kind::Str:
+        case Type::Kind::Bytes:
+            return true;
+        case Type::Kind::List: {
+            auto& lt = static_cast<const ListType&>(*t);
+            if (!lt.elementType) { why = "its element type is unknown"; return false; }
+            return typeIsDubable(lt.elementType.get(), why);
+        }
+        case Type::Kind::Dict: {
+            auto& dt = static_cast<const DictType&>(*t);
+            if (!dt.valueType) { why = "its value type is unknown"; return false; }
+            return typeIsDubable(dt.valueType.get(), why);
+        }
+        case Type::Kind::Set:
+            return true;  // set elements are immutable (i64 / str)
+        case Type::Kind::Tuple: {
+            auto& tt = static_cast<const TupleType&>(*t);
+            for (auto& e : tt.elementTypes) {
+                if (!e) continue;
+                auto k = e->kind();
+                // A tuple dub lowers to an identity retain (immutable spine),
+                // so every element must itself be immutable.
+                if (k != Type::Kind::Int && k != Type::Kind::Float &&
+                    k != Type::Kind::Bool && k != Type::Kind::Str &&
+                    k != Type::Kind::Bytes && k != Type::Kind::None_) {
+                    why = "a tuple holding a mutable element ('" +
+                          e->toString() + "') cannot be identity-copied";
+                    return false;
+                }
+            }
+            return true;
+        }
+        case Type::Kind::Lock:
+            why = "a raw OS mutex cannot be copied; wrap the resource in a "
+                  "class with an own field";
+            return false;
+        case Type::Kind::Function:
+            why = "a closure's captured environment has identity";
+            return false;
+        case Type::Kind::Instance:
+            why = "class dub is not in v1; copy the fields you need";
+            return false;
+        default:
+            why = "its concrete payload is not statically known ('" +
+                  t->toString() + "')";
+            return false;
     }
 }
 

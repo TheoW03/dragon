@@ -623,7 +623,12 @@ void Sema::visit(AnnAssignStmt& node) {
         Symbol* prior = currentScope()->lookupLocal(name->name);
         // Shadowing an injected builtin (outer namespace) is a fresh declaration,
         // not a redeclaration - only a genuine same-scope user binding is an error.
-        if (prior && !prior->isBuiltin) {
+        // A module-level const we hoisted in the pre-pass is THIS statement's own
+        // forward declaration; clear the marker and treat this visit as the real
+        // declaration rather than a redeclaration of itself.
+        if (prior && prior->isModuleForwardDecl) {
+            prior->isModuleForwardDecl = false;
+        } else if (prior && !prior->isBuiltin) {
             const char* what = prior->kind == Symbol::Kind::Parameter
                                    ? "parameter" : "variable";
             error(name->location(), std::string("redeclaration of ") + what + " '" +
@@ -1083,6 +1088,29 @@ void Sema::visit(Module& node) {
             clsSym.declaration = cls->location();
             clsSym.isInitialized = true;
             currentScope()->define(clsSym);
+        } else if (auto* ann = dynamic_cast<AnnAssignStmt*>(s.get())) {
+            // Hoist module-level typed globals (const / static / plain) so a
+            // forward reference to a const defined later in the file resolves,
+            // matching codegen's order-independent global resolution and
+            // Python module semantics. Without this, `if n > _MAX` used above
+            // its `const _MAX: int = ...` definition was flagged undefined -
+            // an error that was silently swallowed for dependency modules
+            // until Tier 5.1 made dependency Sema errors surface, at which
+            // point the false positive broke the stdlib build
+            // (AUDIT-2026-07-09 Tier 5 forward-reference note). Marked so the
+            // second-pass visit recognizes its own hoist and does not report a
+            // redeclaration.
+            if (auto* name = dynamic_cast<NameExpr*>(ann->target.get())) {
+                Symbol sym;
+                sym.name = name->name;
+                sym.kind = Symbol::Kind::Variable;
+                sym.declaration = name->location();
+                sym.isInitialized = (ann->value != nullptr);
+                sym.isConst = ann->isConst;
+                sym.isStatic = ann->isStatic;
+                sym.isModuleForwardDecl = true;
+                currentScope()->define(sym);
+            }
         }
     }
     // Second pass: visit each statement normally. Function/Class visitors

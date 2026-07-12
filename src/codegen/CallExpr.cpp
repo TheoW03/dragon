@@ -450,11 +450,37 @@ void CodeGen::visit(CallExpr& node) {
                 for (size_t i = 0; i < node.args.size(); ++i) {
                     node.args[i]->accept(*this);
                     llvm::Value* arg = impl_->lastValue;
-                    if (pkIt != impl_->funcParamKinds.end() && i < pkIt->second.size()) {
+                    // An own param ADOPTS the arg's +1 (moved binding or
+                    // fresh temp): the callee releases it, so a caller-side
+                    // drain here would double-free (A/B-proven).
+                    bool argDrained = impl_->paramIsOwn(ctorName, (unsigned)i);
+                    if (!argDrained &&
+                        pkIt != impl_->funcParamKinds.end() && i < pkIt->second.size()) {
                         Impl::VarKind dk = impl_->argTempDecrefKind(
                             node.args[i].get(), pkIt->second[i], arg);
-                        if (dk != Impl::VarKind::Other)
+                        if (dk != Impl::VarKind::Other) {
                             argTemps.emplace_back(arg, dk);
+                            argDrained = true;
+                        }
+                    }
+                    if (!argDrained) {
+                        // A MONOMORPHIZED GENERIC ctor (Shelter[Dog](Dog(...)))
+                        // records its erased-T param as a non-heap kind, so the
+                        // funcParamKinds drain above bails and the owned arg
+                        // temp leaked one instance per call. Same fallback as
+                        // the instance-method arg loops: provably-owned boxes
+                        // by value, native temps via the expression-gated
+                        // ownedTempDrainKind (borrowed getters rejected before
+                        // isOwnedStrResult is consulted).
+                        if (arg->getType() == impl_->boxType) {
+                            if (impl_->isOwnedBoxResult(arg))
+                                argTemps.emplace_back(arg, Impl::VarKind::Union);
+                        } else {
+                            Impl::VarKind dk = impl_->ownedTempDrainKind(
+                                node.args[i].get(), arg);
+                            if (dk != Impl::VarKind::Other)
+                                argTemps.emplace_back(arg, dk);
+                        }
                     }
                     // Use coerceArgFromExpr so a concrete-typed arg crossing
                     // into an `Any`/Union ctor param is wrapped in a box with
@@ -506,12 +532,28 @@ void CodeGen::visit(CallExpr& node) {
                             }
                             kwVal->accept(*this);
                             llvm::Value* arg = impl_->lastValue;
+                            bool kwDrained = false;
                             if (pkIt != impl_->funcParamKinds.end() &&
                                 idx < pkIt->second.size()) {
                                 Impl::VarKind dk = impl_->argTempDecrefKind(
                                     kwVal.get(), pkIt->second[idx], arg);
-                                if (dk != Impl::VarKind::Other)
+                                if (dk != Impl::VarKind::Other) {
                                     argTemps.emplace_back(arg, dk);
+                                    kwDrained = true;
+                                }
+                            }
+                            if (!kwDrained) {
+                                // Same erased-T fallback as the positional loop.
+                                if (arg->getType() == impl_->boxType) {
+                                    if (impl_->isOwnedBoxResult(arg))
+                                        argTemps.emplace_back(
+                                            arg, Impl::VarKind::Union);
+                                } else {
+                                    Impl::VarKind dk = impl_->ownedTempDrainKind(
+                                        kwVal.get(), arg);
+                                    if (dk != Impl::VarKind::Other)
+                                        argTemps.emplace_back(arg, dk);
+                                }
                             }
                             llvm::Type* paramTy =
                                 ctorFuncType->getParamType((unsigned)idx);
@@ -521,11 +563,16 @@ void CodeGen::visit(CallExpr& node) {
                 }
                 // Fill missing args with default values
                 impl_->fillDefaultArgs(ctorName, ctorFunc, args, *this, &argTemps);
+                // Exception-safe temps: unwind frees on raise (a ctor body can
+                // raise), pop+decref on normal return.
+                auto argTempBases = impl_->pushArgTempCleanups(argTemps);
                 impl_->lastValue = impl_->normalizeIntC(
                     impl_->builder->CreateCall(ctorFunc, args, "inst"));
+                impl_->popArgTempCleanups(argTempBases);
                 // Release owned heap-temporary arguments now that the ctor has
                 // borrowed them (the fresh instance can't alias an arg).
                 for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                impl_->emitMoveOutSlots(node);
                 return;
             }
         }
@@ -656,13 +703,18 @@ void CodeGen::visit(CallExpr& node) {
             // (val, hiddenTag). For non-union params, coerceArg as before.
             std::vector<llvm::Value*> args;
             // Owned heap-temporary args to release after the call (the callee
-            // borrows; it increfs whatever it retains). Skip extern "C"
-            // callees - they don't follow the RC convention and may take
-            // borrowed/interior pointers (FFI boundary owns nothing).
+            // borrows; it increfs whatever it retains). Extern "C" callees are
+            // drainable under the FFI v0 contract unless they return `ptr`
+            // (see externDrainableFuncs) - nested owned temps like
+            // dragon_str_concat("a", dragon_str_concat(...)) leaked the inner
+            // string per call without this (AUDIT-2026-07-09 1.2).
             std::vector<std::pair<llvm::Value*, Impl::VarKind>> argTemps;
-            auto fpkIt = impl_->externFuncNames.count(func->getName().str())
+            const std::string calleeSym = func->getName().str();
+            const bool externNoDrain = impl_->externFuncNames.count(calleeSym) &&
+                                       !impl_->externDrainableFuncs.count(calleeSym);
+            auto fpkIt = externNoDrain
                              ? impl_->funcParamKinds.end()
-                             : impl_->funcParamKinds.find(func->getName().str());
+                             : impl_->funcParamKinds.find(calleeSym);
             auto funcType = func->getFunctionType();
             for (size_t i = 0; i < node.args.size() && i < funcType->getNumParams(); ++i) {
                 node.args[i]->accept(*this);
@@ -690,11 +742,30 @@ void CodeGen::visit(CallExpr& node) {
                 if (argWrapped) {
                     // Free the per-call wrapper after the call (callee borrows).
                     argTemps.emplace_back(arg, Impl::VarKind::Closure);
-                } else if (fpkIt != impl_->funcParamKinds.end() && i < fpkIt->second.size()) {
-                    Impl::VarKind dk = impl_->argTempDecrefKind(
-                        node.args[i].get(), fpkIt->second[i], arg);
+                } else if (impl_->externDrainableFuncs.count(calleeSym)) {
+                    // Extern callee: classify by the ARG's OWN static type, not
+                    // the declared param kind. The same C symbol can be declared
+                    // with disagreeing Dragon arg types across modules (e.g.
+                    // dragon_tls_write's buf is `str` in ssl.dr but `ptr` in
+                    // postgres.dr, and funcParamKinds keeps only the first);
+                    // trusting `str` there decref'd dragon_bytes_data's INTERIOR
+                    // pointer as a string (AUDIT-2026-07-09 postgres UAF).
+                    // ownedTempDrainKind gates on the arg expr's static type, so
+                    // an interior-ptr result (type ptr, not a heap kind) is never
+                    // drained while a genuine owned str/bytes temp still is.
+                    Impl::VarKind dk = impl_->ownedTempDrainKind(node.args[i].get(), arg);
                     if (dk != Impl::VarKind::Other)
                         argTemps.emplace_back(arg, dk);
+                } else if (fpkIt != impl_->funcParamKinds.end() && i < fpkIt->second.size()) {
+                    // An own param ADOPTS the arg's +1 (moved binding or fresh
+                    // temp): the callee releases it; a caller drain here would
+                    // double-free (A/B-proven fresh-temp probe).
+                    if (!impl_->paramIsOwn(calleeSym, (unsigned)i)) {
+                        Impl::VarKind dk = impl_->argTempDecrefKind(
+                            node.args[i].get(), fpkIt->second[i], arg);
+                        if (dk != Impl::VarKind::Other)
+                            argTemps.emplace_back(arg, dk);
+                    }
                 }
                 llvm::Type* paramTy = funcType->getParamType(i);
                 // Box-or-coerce through the shared owner-aware path: a borrowed
@@ -780,6 +851,11 @@ void CodeGen::visit(CallExpr& node) {
             // Fill missing args with default values; key by the resolved
             // LLVM symbol (matches funcParamDefaults' post-mangling write).
             impl_->fillDefaultArgs(func->getName().str(), func, args, *this, &argTemps);
+            // Register the temps on the runtime cleanup stack: the decref
+            // below only runs on normal return, so without this an owned temp
+            // leaks whenever the callee raises. Freed by exactly one path: the
+            // unwind on raise, or the pop+decref on normal return.
+            auto argTempBases = impl_->pushArgTempCleanups(argTemps);
             if (func->getReturnType() == impl_->voidType) {
                 impl_->builder->CreateCall(func, args);
                 impl_->lastValue = llvm::ConstantPointerNull::get(
@@ -788,10 +864,14 @@ void CodeGen::visit(CallExpr& node) {
                 impl_->lastValue = impl_->normalizeIntC(
                     impl_->builder->CreateCall(func, args, "call"));
             }
+            // Normal return: rewind the cleanup entries (does NOT free) BEFORE
+            // the decref, so each temp is released exactly once (here).
+            impl_->popArgTempCleanups(argTempBases);
             // Release owned heap-temporary arguments. Safe even when the callee
             // returns one of them: the return path increfs borrowed values, so
             // the result carries its own reference independent of the arg temp.
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
             return;
         }
 
@@ -1211,9 +1291,13 @@ void CodeGen::visit(CallExpr& node) {
                         args.push_back(arg);
                     }
                     impl_->fillDefaultArgs(ctorName, ctorFunc, args, *this, &argTemps);
+                    // Exception-safe temps (see the same-module ctor path).
+                    auto argTempBases = impl_->pushArgTempCleanups(argTemps);
                     impl_->lastValue = impl_->normalizeIntC(
                         impl_->builder->CreateCall(ctorFunc, args, "inst"));
+                    impl_->popArgTempCleanups(argTempBases);
                     for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                    impl_->emitMoveOutSlots(node);
                     return;
                 }
             }
@@ -1245,23 +1329,38 @@ void CodeGen::visit(CallExpr& node) {
                 // borrows its arguments (it increfs whatever it retains), so an
                 // owned temp like `mod.f(a + b)` / `mod.f(str(x))` leaks once per
                 // call unless released here. Mirrors the same-module direct-call
-                // path; skip extern "C" callees (no RC convention at the FFI edge).
+                // path; extern "C" callees are drainable under the FFI v0
+                // contract unless they return `ptr` (see externDrainableFuncs).
                 std::vector<std::pair<llvm::Value*, Impl::VarKind>> argTemps;
-                auto fpkIt = impl_->externFuncNames.count(func->getName().str())
+                const std::string calleeSym2 = func->getName().str();
+                const bool externNoDrain2 =
+                    impl_->externFuncNames.count(calleeSym2) &&
+                    !impl_->externDrainableFuncs.count(calleeSym2);
+                auto fpkIt = externNoDrain2
                                  ? impl_->funcParamKinds.end()
-                                 : impl_->funcParamKinds.find(func->getName().str());
+                                 : impl_->funcParamKinds.find(calleeSym2);
                 for (size_t i = 0; i < node.args.size(); ++i) {
                     node.args[i]->accept(*this);
                     llvm::Value* arg = impl_->lastValue;
                     // Classify the raw (pre-box/coerce) value, as the same-module
-                    // path does: argTempDecrefKind returns Other for borrowed
-                    // exprs / str literals / scalar+union params, so only a
-                    // genuinely owned heap temp is collected for release.
-                    if (fpkIt != impl_->funcParamKinds.end() && i < fpkIt->second.size()) {
-                        Impl::VarKind dk = impl_->argTempDecrefKind(
-                            node.args[i].get(), fpkIt->second[i], arg);
+                    // path does. For an extern callee, gate on the ARG's own
+                    // static type (ownedTempDrainKind), never the declared param
+                    // kind - the same C symbol can carry disagreeing arg types
+                    // across modules (AUDIT-2026-07-09 postgres UAF, see the
+                    // same-module path). Dragon callees keep the param-kind
+                    // classifier.
+                    if (impl_->externDrainableFuncs.count(calleeSym2)) {
+                        Impl::VarKind dk = impl_->ownedTempDrainKind(node.args[i].get(), arg);
                         if (dk != Impl::VarKind::Other)
                             argTemps.emplace_back(arg, dk);
+                    } else if (fpkIt != impl_->funcParamKinds.end() && i < fpkIt->second.size()) {
+                        // own param: the callee adopts the +1 - no caller drain.
+                        if (!impl_->paramIsOwn(calleeSym2, (unsigned)i)) {
+                            Impl::VarKind dk = impl_->argTempDecrefKind(
+                                node.args[i].get(), fpkIt->second[i], arg);
+                            if (dk != Impl::VarKind::Other)
+                                argTemps.emplace_back(arg, dk);
+                        }
                     }
                     if (i < funcType->getNumParams()) {
                         // Box-or-coerce through the shared owner-aware path: an
@@ -1277,6 +1376,9 @@ void CodeGen::visit(CallExpr& node) {
                 // resolved function's name - pre-mangling we passed
                 // attr->attribute which silently missed the mangled key.
                 impl_->fillDefaultArgs(func->getName().str(), func, args, *this, &argTemps);
+                // Exception-safe temps: unwind frees on raise, pop+decref on
+                // normal return (see the same-module direct-call path).
+                auto argTempBases = impl_->pushArgTempCleanups(argTemps);
                 if (func->getReturnType() == impl_->voidType) {
                     impl_->builder->CreateCall(func, args);
                     impl_->lastValue = llvm::ConstantPointerNull::get(
@@ -1285,8 +1387,10 @@ void CodeGen::visit(CallExpr& node) {
                     impl_->lastValue = impl_->normalizeIntC(
                         impl_->builder->CreateCall(func, args, "modcall"));
                 }
+                impl_->popArgTempCleanups(argTempBases);
                 // Release owned heap-temporary arguments (callee borrowed them).
                 for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                impl_->emitMoveOutSlots(node);
                 return;
             }
             impl_->addError(
@@ -1595,6 +1699,15 @@ void CodeGen::emitVarArgCall(llvm::Function* func, CallExpr& node) {
         packedArgsList = argsList;
         llvmIdx++;
     }
+    // The *args pack is a call-site-owned temp alive across the binding guards
+    // below (which can raise via longjmp), so register it on the unwind stack
+    // too - a stray-key raise into an args-only callee leaked it otherwise
+    // (AUDIT-2026-07-09 1.3). Pushed AFTER argsList exists, popped before its
+    // tail drain, in reverse order relative to the spread-dict entry.
+    llvm::Value* packedArgsCleanupBase = nullptr;
+    if (packedArgsList)
+        packedArgsCleanupBase =
+            impl_->emitCleanupPushTemp(packedArgsList, Impl::DCLEAN_OBJ);
 
     // 2b. Bind keyword arguments that name a regular parameter (before *args)
     // into that positional slot - mirrors the non-variadic D040 binding so
@@ -1643,11 +1756,13 @@ void CodeGen::emitVarArgCall(llvm::Function* func, CallExpr& node) {
     else if (auto* ca = dynamic_cast<AttributeExpr*>(node.callee.get()))
         dispName = "function '" + ca->attribute + "'";
     llvm::Value* spreadSrc = nullptr;
+    Expr* spreadSrcExpr = nullptr;  // the `**source` expr, for the owned-temp drain
     {
         Expr* spreadExpr = nullptr;
         int spreadCount = 0;
         for (auto& kw : node.kwArgs)
             if (kw.first.empty()) { spreadCount++; spreadExpr = kw.second.get(); }
+        spreadSrcExpr = spreadExpr;
         if (spreadCount > 1) {
             spreadFail("multiple `**dict` spreads into one call are not "
                        "supported", node.location());
@@ -1661,6 +1776,16 @@ void CodeGen::emitVarArgCall(llvm::Function* func, CallExpr& node) {
                     spreadSrc, impl_->i8PtrType);
         }
     }
+    // Register an inline `**{literal}` spread source on the unwind cleanup
+    // stack for the whole bind+call: the duplicate/missing/stray-key guards
+    // below raise via longjmp, skipping the normal-path drain at the tail, so
+    // the synthesized dict leaked on every raising call (AUDIT-2026-07-09 1.3,
+    // test_kwargs_spread *_raises). Freed by exactly one path: the unwind on
+    // raise, or the pop+decref at the tail.
+    llvm::Value* spreadCleanupBase = nullptr;
+    if (spreadSrc && spreadSrcExpr &&
+        impl_->ownedTempDrainKind(spreadSrcExpr, spreadSrc) != Impl::VarKind::Other)
+        spreadCleanupBase = impl_->emitCleanupPushTemp(spreadSrc, Impl::DCLEAN_OBJ);
     // Emit `if dict has <name>: raise TypeError multiple values` against the
     // spread source - used for filled regular slots and explicit keywords.
     auto emitSpreadDupCheck = [&](const std::string& argName) {
@@ -1821,6 +1946,12 @@ void CodeGen::emitVarArgCall(llvm::Function* func, CallExpr& node) {
             impl_->builder->CreateCall(func, args, "call"));
     }
 
+    // Normal path: rewind the unwind cleanup entries (does NOT free) BEFORE the
+    // decrefs so each pack is released exactly once here. Pop in REVERSE push
+    // order (spread dict pushed last, args pack first).
+    if (spreadCleanupBase) impl_->emitCleanupPopTemp(spreadCleanupBase);
+    if (packedArgsCleanupBase) impl_->emitCleanupPopTemp(packedArgsCleanupBase);
+
     // Release the call-site-owned packs (see declaration above). The callee
     // borrowed them; anything it kept took its own ref via the return/store
     // incref rules.
@@ -1828,6 +1959,16 @@ void CodeGen::emitVarArgCall(llvm::Function* func, CallExpr& node) {
         impl_->emitDecrefByKind(packedArgsList, Impl::VarKind::List);
     if (packedKwargsDict)
         impl_->emitDecrefByKind(packedKwargsDict, Impl::VarKind::Dict);
+    // An INLINE `**{literal}` spread source into a variadic callee is an owned
+    // temp only read from during binding - drain it here (a named `**opts`
+    // source classifies borrowed and stays its owner's). This mirrors the
+    // non-variadic emitSpreadCall drain; without it f(**{...}) leaked the whole
+    // synthesized dict per call (AUDIT-2026-07-09 1.3, test_kwargs_spread).
+    if (spreadSrc && spreadSrcExpr) {
+        Impl::VarKind dk = impl_->ownedTempDrainKind(spreadSrcExpr, spreadSrc);
+        if (dk != Impl::VarKind::Other)
+            impl_->emitDecrefByKind(spreadSrc, dk);
+    }
 }
 
 //===----------------------------------------------------------------------===//
@@ -2220,6 +2361,17 @@ bool CodeGen::Impl::expandSpreadCallArgs(
             llvm::Value* d = lastValue;
             if (!d->getType()->isPointerTy())
                 d = builder->CreateIntToPtr(d, i8PtrType);
+            // An INLINE literal spread source (`f(**{"name": v})`) is an owned
+            // temp the binding only reads from: without a post-call drain the
+            // whole synthesized dict (struct + buckets + keys + values) leaked
+            // once per call (AUDIT-2026-07-09 1.3). The bound args are borrows
+            // into the dict, so it is released AFTER the call via argTemps,
+            // never before. A named spread source (`f(**opts)`) classifies
+            // borrowed and stays its owner's.
+            {
+                VarKind spreadDk = ownedTempDrainKind(dictSpread, d);
+                if (spreadDk != VarKind::Other) argTemps.emplace_back(d, spreadDk);
+            }
             auto defIt = funcParamDefaults.find(symName);
 
             // Allowed bindable names = the still-unfilled params (excludes
@@ -2367,6 +2519,8 @@ void CodeGen::emitSpreadCall(llvm::Function* func, CallExpr& node,
 
     // Fill remaining holes with defaults, then emit the call.
     impl_->fillDefaultArgs(func->getName().str(), func, args, *this, &argTemps);
+    // Exception-safe temps: unwind frees on raise, pop+decref on normal return.
+    auto argTempBases = impl_->pushArgTempCleanups(argTemps);
     if (func->getReturnType() == impl_->voidType) {
         impl_->builder->CreateCall(func, args);
         impl_->lastValue = llvm::ConstantPointerNull::get(
@@ -2375,9 +2529,12 @@ void CodeGen::emitSpreadCall(llvm::Function* func, CallExpr& node,
         impl_->lastValue = impl_->normalizeIntC(
             impl_->builder->CreateCall(func, args, "spreadcall"));
     }
+    impl_->popArgTempCleanups(argTempBases);
     // Release owned heap-temporary arguments (spread elements are borrowed and
-    // intentionally absent from argTemps).
+    // intentionally absent from argTemps; an inline `**{...}` literal source
+    // IS in argTemps and is released here, after its borrows are done).
     for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+    impl_->emitMoveOutSlots(node);
 }
 
 } // namespace dragon

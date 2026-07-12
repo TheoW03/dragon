@@ -144,6 +144,13 @@ void CodeGen::visit(AugAssignStmt& node) {
             llvm::Value* result = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_bytes_concat"], {current, rhs}, "bytescat");
             storeBack(result, varKind, /*newIsBorrowed=*/false);
+            // bytes_concat copies both operands; an owned rhs temp (call
+            // result, literal, nested concat) is otherwise orphaned - the
+            // same drain the BinaryExpr bytes path carries. isOwnedPtrResult
+            // screens out borrowed names/fields; storeBack already released
+            // the old slot value, so only rhs needs draining here.
+            if (impl_->options.gcMode == GCMode::RC && impl_->isOwnedPtrResult(rhs))
+                impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {rhs});
             return;
         }
 
@@ -723,8 +730,13 @@ void CodeGen::visit(AnnAssignStmt& node) {
                 if (auto* n = dynamic_cast<NameExpr*>(attr->object.get()))
                     rhsIsDictAccess = impl_->lookupVarKind(n->name) == Impl::VarKind::Dict;
             }
-            if (rhsIsDictAccess)
+            if (rhsIsDictAccess) {
                 impl_->pendingDictCheckTag = tag;
+                // For a list-annotated LHS, ride the representation check
+                // along: tag 5 alone can't tell DragonList from DragonListBox.
+                impl_->pendingListViewElemTag =
+                    impl_->listViewWantElemTag(node.annotation.get());
+            }
         }
     }
 
@@ -868,6 +880,11 @@ void CodeGen::visit(AnnAssignStmt& node) {
                         impl_->storeWithRCOverwrite(
                             gep, fieldType, val, fieldKind, newKind, rhsBorrowed,
                             className + "." + attrTarget->attribute);
+                        // `self._f = own x`: the field adopted the +1
+                        // (rhsBorrowed=false via isBorrowedHeapExpr's move
+                        // exception); null the source so scope exit sees
+                        // nothing (docs/002 2.4 row 3).
+                        impl_->emitMoveOutIfMarked(node.value.get());
                         return;
                     }
                 }
@@ -904,8 +921,18 @@ void CodeGen::visit(AnnAssignStmt& node) {
             // dispatch (CallMethods.cpp) and with-statement lowering reach the
             // dragon_lock_* runtime, mirroring the bare `lock = Lock()` path.
             if (auto* nt = dynamic_cast<NamedTypeExpr*>(node.annotation.get()))
-                if (nt->name == "Lock")
+                if (nt->name == "Lock") {
                     impl_->varClassNames[name->name] = "__Lock";
+                    // docs/002 2.10: the scope owns a bare Lock LOCAL - arm
+                    // the null-gated destroy at scope exit. Module-level
+                    // Locks live for the process (not armed).
+                    bool modLevel =
+                        (impl_->currentFunction == impl_->mainFunction) &&
+                        (impl_->scopes.size() <= impl_->moduleBodyScopeDepth);
+                    if (!modLevel && !impl_->scopes.empty())
+                        impl_->scopes.back().lockDestroyOnExit.insert(
+                            name->name);
+                }
         }
 
         // Module-level declaration: create LLVM GlobalVariable only (no local alloca).
@@ -1022,14 +1049,30 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     // any USE of the narrowed global segfaulted. Block-local and
                     // function-local narrows already went through the local path;
                     // only a bare module-top-level narrow hit this gap.
+                    //
+                    // The extraction is CHECKED (unboxBoxResultChecked): the
+                    // old bare boxPayloadAsKind trusted the annotation, so a
+                    // module-scope `s: str = xs[0]` over a mistyped element
+                    // increfed a garbage payload (SEGV in dragon_incref_str)
+                    // instead of raising TypeError like the local path. The
+                    // list representation check rides along via
+                    // listViewWantElemTag (DragonList vs DragonListBox).
                     if (val->getType() == impl_->boxType &&
                         gv->getValueType() != impl_->boxType) {
-                        val = impl_->boxPayloadAsKind(
-                            val, Impl::typeKindToVarKind(
-                                     gv->getValueType() == impl_->f64Type ? Type::Kind::Float :
-                                     gv->getValueType() == impl_->i1Type ? Type::Kind::Bool :
-                                     gv->getValueType()->isPointerTy() ? Type::Kind::Str :
-                                     Type::Kind::Int));
+                        llvm::Value* unboxed = impl_->unboxBoxResultChecked(
+                            val, gv->getValueType(), varKind,
+                            impl_->listViewWantElemTag(node.annotation.get()));
+                        // Kinds with no tag mapping (tuple/set/...) come back
+                        // as the box - extract at the slot's shape unchecked,
+                        // matching the previous behavior for those kinds.
+                        if (unboxed->getType() == impl_->boxType)
+                            unboxed = impl_->boxPayloadAsKind(
+                                val, Impl::typeKindToVarKind(
+                                         gv->getValueType() == impl_->f64Type ? Type::Kind::Float :
+                                         gv->getValueType() == impl_->i1Type ? Type::Kind::Bool :
+                                         gv->getValueType()->isPointerTy() ? Type::Kind::Str :
+                                         Type::Kind::Int));
+                        val = unboxed;
                     }
                     impl_->storeWithRCOverwrite(
                         gv, gv->getValueType(), val, oldKind, varKind, rhsBorrowed, name->name);
@@ -1287,6 +1330,19 @@ void CodeGen::visit(AnnAssignStmt& node) {
                 // pendingDictCheckTag-style dispatch (Phase 2) handles the
                 // dict[str, Any] case at the subscript-read site. This branch
                 // catches every other box-source path uniformly.
+                //
+                // An OWNED box result (dragon_box_subscript / box_binop on an
+                // `Any` value) unboxed into a native slot below carries a +1 on
+                // its payload that the store neither adopts nor releases (it
+                // increfs for the slot's own ref, or - Other-kind - ignores),
+                // orphaning the box's +1 (one leaked payload per
+                // `x: str = anyVal[k]`). Capture it here and release after the
+                // store. Gated on isOwnedBoxResult: a BORROWED element read
+                // (dict_get_box / list_box_get, e.g. `const s: str = typedDict[k]`
+                // over a parsed dict[str,Any]) carries no +1 -> skip (double-free).
+                bool ownedBoxUnboxed = false;
+                llvm::Value* ownedBoxPayload = nullptr;
+                llvm::Value* ownedBoxTag = nullptr;
                 if (val->getType() == impl_->boxType && allocType != impl_->boxType) {
                     int64_t expectedTag = -1;
                     const char* tagName = "value";
@@ -1340,6 +1396,14 @@ void CodeGen::visit(AnnAssignStmt& node) {
                         // OK path: extract payload as the target native type.
                         impl_->builder->SetInsertPoint(okBB);
                         auto* payloadI64 = impl_->boxPayloadI64(val, "ub.payload");
+                        // Capture the OWNED box's +1 before `val` is reassigned to
+                        // the bare payload; released after the store below.
+                        if (impl_->options.gcMode == GCMode::RC &&
+                            impl_->isOwnedBoxResult(val)) {
+                            ownedBoxUnboxed = true;
+                            ownedBoxPayload = payloadI64;
+                            ownedBoxTag = tagV;
+                        }
                         if (allocType == impl_->i64Type) {
                             val = payloadI64;
                         } else if (allocType == impl_->f64Type) {
@@ -1353,6 +1417,21 @@ void CodeGen::visit(AnnAssignStmt& node) {
                         } else if (allocType == impl_->i8PtrType) {
                             val = impl_->builder->CreateIntToPtr(
                                 payloadI64, impl_->i8PtrType, "ub.ptr");
+                            // A list-tagged payload must also match the
+                            // target's element REPRESENTATION (DragonList vs
+                            // DragonListBox, elem_tag) - the box tag alone
+                            // cannot tell them apart and reading one at the
+                            // other's stride corrupts silently.
+                            if (expectedTag == 5) {
+                                int64_t want = impl_->listViewWantElemTag(
+                                    node.annotation.get());
+                                if (want != Impl::kNoListElemCheck)
+                                    impl_->builder->CreateCall(
+                                        impl_->runtimeFuncs
+                                            ["dragon_list_view_check"],
+                                        {val, llvm::ConstantInt::get(
+                                                  impl_->i64Type, want)});
+                            }
                         }
                     }
                 }
@@ -1455,6 +1534,18 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     impl_->storeWithRCOverwrite(
                         alloca, allocType, val, oldKind, varKind, rhsBorrowed, name->name);
                 }
+                // Release the OWNED box temporary's +1 (captured above), but ONLY
+                // when the store treated the RHS as borrowed (rhsBorrowed) and so
+                // took its OWN independent ref (incref) - then the box's +1 is
+                // surplus. This is exactly the box_subscript-on-Any case: the
+                // container still owns the payload, box_subscript increfed a second
+                // ref, and the slot increfed a third; drop the box's. A box_binop
+                // result (`s: str = a + "y"`) is a FRESH payload with no other
+                // owner and rhsBorrowed=false, so the store ADOPTS the box's +1 -
+                // releasing it there double-freed (A/B-proven UAF in
+                // test_box_arithmetic). Tag-gated: no-op for a non-heap payload.
+                if (ownedBoxUnboxed && rhsBorrowed)
+                    impl_->emitUnionDecref(ownedBoxPayload, ownedBoxTag);
 
                 // D027: closure from capturing lambda (reassignment)
                 if (impl_->lastClosureCallableType) {

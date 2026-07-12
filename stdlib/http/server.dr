@@ -116,7 +116,7 @@ extern "C" def dragon_stat_isfile(path: str) -> int
 
 # Additional string ops
 extern "C" def dragon_str_endswith(s: str, suffix: str) -> int
-extern "C" def dragon_str_join(sep: str, parts: list) -> str
+extern "C" def dragon_str_join(sep: str, parts: list[str]) -> str
 
 # Green thread spawning
 extern "C" def dragon_vthread_spawn(fn: ptr, args: ptr, nargs: int) -> ptr
@@ -634,6 +634,14 @@ def _int_to_hex(n: int) -> str {
 #===----------------------------------------------------------------------===#
 
 class Route {
+    # Declared so the element types are statically KNOWN (zen: in the face of
+    # ambiguity, annotate). Ctor-inferred list fields lose their element type,
+    # and every `seg[0]` / slice temp in the parsing loop below then
+    # misclassifies as a borrow and leaks one small string per registration.
+    segments: list[str]
+    param_names: list[str]
+    param_types: list[str]
+
     def(method: str, pattern: str, handler: Callable[[Request, Response, Context], None]) {
         self.method = method
         self.pattern = pattern
@@ -695,6 +703,12 @@ class Route {
 # method since every upgrade arrives as GET.
 
 class WsRoute {
+    # Declared for the same reason as Route: statically-known element types
+    # keep the parsing-loop temps correctly classified (and released).
+    segments: list[str]
+    param_names: list[str]
+    param_types: list[str]
+
     def(pattern: str, handler: Callable[[WebSocket], None]) {
         self.pattern = pattern
         self.handler = handler
@@ -866,6 +880,12 @@ class Router {
     # TLS context, assigned only by listen_tls() (declared here so the field
     # exists even before TLS is enabled - guarded by _tls_enabled below).
     _ssl_context: SSLContext
+    # Sole owner of the app-storage mutex: destroyed when the Router dies
+    # (docs/001-memory.md; was AUDIT 2.3's leaked pthread mutex).
+    own _storage_lock: Lock
+    # Sole owner of the live-connection counter (an 8-byte atomic cell the
+    # accept loop and connection vthreads share): freed when the Router dies.
+    own _conn_cell: ptr
 
     def(port: int = 8000, host: str = "0.0.0.0", apex: str = "") {
         self.host = host
@@ -898,7 +918,7 @@ class Router {
         # mutation dector abors). keep/peek/unkeep take this lock so the documented API
         # honors the cntract out of the box. peek locks too, an unlocked read racing a
         # concurrent rehash can walk freed entries
-        self._storage_lock: Lock = Lock()
+        self._storage_lock = Lock()
         self._config: dict[str, str] = {}
         self._on_startup: list[Callable[[Router], None]] = []
         self._on_shutdown: list[Callable[[Router], None]] = []
@@ -932,7 +952,7 @@ class Router {
         # mutated atomically (the accept loop and connection vthreads run on
         # different OS threads). 0 max disables the cap.
         self._max_connections: int = _MAX_CONNECTIONS
-        self._conn_cell: ptr = malloc(8)
+        self._conn_cell = malloc(8)
         dragon_atomic_store(self._conn_cell, 0)
         # Host allowlist. Empty = accept any Host (dev default). When non-empty,
         # a request whose Host (sans port) is not listed gets 421, blocking

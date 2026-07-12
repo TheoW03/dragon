@@ -1110,6 +1110,17 @@ int64_t CodeGen::Impl::inferPtrValueTag(Expr* expr) {
         // heap when the 16 bytes preceding the buffer happen to look like a
         // valid header.
         if (expr && expr->type) {
+            // Class instances carry TAG_CLASS (7) in the dict/box VALUE tag
+            // domain - matching typeKindToTag, the boxed-Any tag, and the
+            // annotated-read expectation. typeKindToElemTag's Instance -> 5 is
+            // the LIST elem_tag domain only (variant choice + decref routing);
+            // storing 5 here made every annotated read of a dict[str, Cls]
+            // value raise "is list, not bytes", made isinstance miss on
+            // dict[str, Any]-held instances, and steered print/json.dumps
+            // into walking the instance as a list (ASan OOB). RC-neutral:
+            // tags 5 and 7 both route the generic header-dispatched
+            // dragon_incref/decref in every dict/tuple/set path.
+            if (expr->type->kind() == Type::Kind::Instance) return 7;
             return typeKindToElemTag(expr->type->kind());
         }
         // Type is unresolved - fall back to AST node shape.
@@ -1132,14 +1143,16 @@ int64_t CodeGen::Impl::inferPtrValueTag(Expr* expr) {
                 case VarKind::Dict:       return 6;
                 case VarKind::Tuple:      return 5;
                 case VarKind::Set:        return 5;
-                case VarKind::ClassInstance: return 5;
+                case VarKind::ClassInstance: return 7; // TAG_CLASS - see the
+                                                       // resolved-type branch
                 default: break;
             }
         }
         if (auto* callExpr = dynamic_cast<CallExpr*>(expr)) {
             if (auto* calleeName = dynamic_cast<NameExpr*>(callExpr->callee.get())) {
                 if (classNames.count(calleeName->name))
-                    return 5; // class instance -> dragon_decref
+                    return 7; // TAG_CLASS (fresh construction) - decref is the
+                              // same generic dragon_decref as tag 5
             }
         }
         return 1; // default for unresolved pointers: assume string
@@ -1262,6 +1275,28 @@ void CodeGen::Impl::emitCleanupPopTemp(llvm::Value* baseAlloca) {
         builder->SetInsertPoint(contBB);
     }
 
+std::vector<llvm::Value*> CodeGen::Impl::pushArgTempCleanups(
+        const std::vector<std::pair<llvm::Value*, VarKind>>& argTemps) {
+        std::vector<llvm::Value*> bases;
+        if (options.gcMode != GCMode::RC) return bases;
+        for (auto& [v, k] : argTemps) {
+            int ck = cleanupKindFor(k);
+            // Tag-independent kinds only: the temp-cleanup path stores no box
+            // value-tag, so DCLEAN_UNION (and non-heap kind 0) are left to the
+            // existing normal-path decref rather than risk a wrong-kind free.
+            if (ck == DCLEAN_STR || ck == DCLEAN_CALLABLE || ck == DCLEAN_OBJ)
+                bases.push_back(emitCleanupPushTemp(v, ck));
+        }
+        return bases;
+    }
+
+void CodeGen::Impl::popArgTempCleanups(const std::vector<llvm::Value*>& bases) {
+        // Reverse push order: each temp's base rewinds to the depth just before
+        // that temp was pushed, so unwinding them last-in-first-out is correct.
+        for (auto it = bases.rbegin(); it != bases.rend(); ++it)
+            emitCleanupPopTemp(*it);
+    }
+
 void CodeGen::Impl::emitScopeCleanupFor(Scope& scope) {
         for (auto& [name, alloca] : scope.vars) {
             if (scope.borrowed.count(name)) continue;  // don't decref params
@@ -1320,6 +1355,32 @@ void CodeGen::Impl::emitScopeCleanupFor(Scope& scope) {
             if (vit == scope.vars.end()) continue;
             auto* tv = builder->CreateLoad(i8PtrType, vit->second, name + ".task.detach");
             builder->CreateCall(runtimeFuncs["dragon_vthread_detach"], {tv});
+        }
+        // docs/002 ADR 2.10: bare Lock locals - the scope owns the mutex, so
+        // destroy it here. Null-gated: `del lk` already destroyed it and
+        // nulled the slot, so the deleted case is a provably-dead branch, not
+        // a runtime drop flag (E9-at-join forbids path-dependent consumption).
+        for (const auto& name : scope.lockDestroyOnExit) {
+            auto vit = scope.vars.find(name);
+            if (vit == scope.vars.end()) continue;
+            if (scope.borrowed.count(name)) continue;
+            auto* lv = builder->CreateLoad(i8PtrType, vit->second,
+                                           name + ".lock.exit");
+            auto* nonNull = builder->CreateICmpNE(
+                lv,
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(lv->getType())),
+                name + ".lock.set");
+            auto* func = currentFunction;
+            auto* relBB =
+                llvm::BasicBlock::Create(*context, name + ".lock.rel", func);
+            auto* contBB =
+                llvm::BasicBlock::Create(*context, name + ".lock.cont", func);
+            builder->CreateCondBr(nonNull, relBB, contBB);
+            builder->SetInsertPoint(relBB);
+            builder->CreateCall(runtimeFuncs["dragon_lock_destroy"], {lv});
+            builder->CreateBr(contBB);
+            builder->SetInsertPoint(contBB);
         }
         // Unwind cleanup: this scope's owned heap locals were just decref'd on
         // the NORMAL exit path, so rewind the cleanup stack to the depth captured

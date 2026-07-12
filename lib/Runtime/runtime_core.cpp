@@ -166,6 +166,13 @@ static void dragon_dealloc(void* obj) {
             dragon_generator_destroy(obj);
             break;
         case DRAGON_TAG_TYPE:
+            // No free(obj): class descriptors are ALWAYS immortal - the single
+            // creation site (dragon_class_descriptor_create) calls
+            // dragon_make_immortal before returning, so decref no-ops on them
+            // and this case is unreachable today. Verified AUDIT-2026-07-09
+            // Tier 4; if a mortal TAG_TYPE object is ever introduced, this
+            // must learn to free the shell (name/doc are .rodata borrows, but
+            // ancestor_ids is malloc'd).
             break;
         case DRAGON_TAG_CLOSURE:
             dragon_closure_dealloc((DragonClosure*)obj);
@@ -506,12 +513,11 @@ static void dragon_list_traverse(void* obj, dragon_gc_visit_fn visit, void* arg)
     // premature free / UAF. Single source of truth: value_tag_is_traceable.
     // leaks.md #11: a list[Callable] (elem_tag == DRAGON_TAG_CLOSURE == 10) can
     // hold a closure that captures the list back (xs.append(lambda{...xs...})),
-    // a real cycle. Visit closure elements too. The visit fns (subtract/
-    // reachable) only dereference a child that is in the tracked set, so a BARE
-    // fn-ptr element (no header, never tracked) is a safe hash-miss no-op - no
-    // tag gate needed on this traverse side (unlike the deref-on-clear side).
-    if (dragon_value_tag_is_traceable((int8_t)l->elem_tag) ||
-        l->elem_tag == DRAGON_TAG_CLOSURE) {
+    // a real cycle. Closure elements are covered by the shared predicate (see
+    // its comment in runtime_internal.h): the visit fns (subtract/reachable)
+    // only dereference a child that is in the tracked set, so a BARE fn-ptr
+    // element (no header, never tracked) is a safe hash-miss no-op.
+    if (dragon_value_tag_is_traceable((int8_t)l->elem_tag)) {
         for (int64_t i = 0; i < l->size; i++) {
             int64_t v = dragon_list_load(l, i);
             if (v) visit((void*)(uintptr_t)v, arg);
@@ -526,11 +532,11 @@ static void dragon_dict_traverse(void* obj, dragon_gc_visit_fn visit, void* arg)
         // TAG_INT entries hold raw integers, not heap pointers - visiting them
         // lets an attacker-supplied value alias a tracked address and corrupt
         // its ref tally during trial-deletion. Only traceable tags are heap
-        // children (single source of truth: value_tag_is_traceable).
-        // #11: dict[K, Callable] values (tag 10) can capture the dict back.
-        // Visit is deref-safe on a bare fn ptr (hash-miss), so no tag gate here.
-        if ((dragon_value_tag_is_traceable(d->entries[i].tag) ||
-             d->entries[i].tag == DRAGON_TAG_CLOSURE) && d->entries[i].value)
+        // children (single source of truth: value_tag_is_traceable, which
+        // includes tag-10 Callable values - #11: dict[K, Callable] values can
+        // capture the dict back; visit is deref-safe on a bare fn ptr).
+        if (dragon_value_tag_is_traceable(d->entries[i].tag) &&
+            d->entries[i].value)
             visit((void*)(uintptr_t)d->entries[i].value, arg);
     }
 }
@@ -541,9 +547,9 @@ static void dragon_tuple_traverse(void* obj, dragon_gc_visit_fn visit, void* arg
     if (t->elem_tags) {
         for (int64_t i = 0; i < t->length; i++) {
             uint8_t tag = t->elem_tags[i];
-            // #11: tuple Callable elements (tag 10) too; visit is deref-safe.
-            if ((dragon_value_tag_is_traceable((int8_t)tag) ||
-                 tag == DRAGON_TAG_CLOSURE) && t->data[i])
+            // #11: tuple Callable elements (tag 10) are covered by the shared
+            // predicate; visit is deref-safe on a bare fn ptr (hash-miss).
+            if (dragon_value_tag_is_traceable((int8_t)tag) && t->data[i])
                 visit((void*)(uintptr_t)t->data[i], arg);
         }
     } else {
@@ -558,10 +564,10 @@ static void dragon_set_traverse(void* obj, dragon_gc_visit_fn visit, void* arg) 
     if (!s || !s->buckets || s->count == 0) return;
     // TAG_INT set elements are raw integers, never heap pointers - must not be
     // traversed (attacker-supplied value could alias a tracked address). Only
-    // traceable tags are heap children. #11: set[Callable] elements (tag 10)
-    // are heap children too; visit is deref-safe on a bare fn ptr (hash-miss).
-    if (dragon_value_tag_is_traceable((int8_t)s->elem_tag) ||
-        s->elem_tag == DRAGON_TAG_CLOSURE) {
+    // traceable tags are heap children; #11: set[Callable] elements (tag 10)
+    // are covered by the shared predicate (visit is deref-safe on a bare fn
+    // ptr - hash-miss).
+    if (dragon_value_tag_is_traceable((int8_t)s->elem_tag)) {
         for (int64_t i = 0; i < s->capacity; i++) {
             if (s->states[i] == 1 && s->buckets[i])
                 visit((void*)(uintptr_t)s->buckets[i], arg);
@@ -572,6 +578,12 @@ static void dragon_set_traverse(void* obj, dragon_gc_visit_fn visit, void* arg) 
 // list[Any] uses per-element {tag, payload}; visit only heap-tagged children.
 // Mirrors dragon_dict_traverse - children are tracked via their own header,
 // so the trial-deletion algorithm can subtract internal references.
+// Deliberately NOT the shared traceable predicate: tag-10 closure payloads
+// must NOT be visited while the box does not OWN closure refs (see the WALL
+// note in dragon_listbox_decref_elem, runtime_list.cpp - codegen appends
+// borrowed Callables at +0). Subtracting a non-owned edge in trial deletion
+// could drive a LIVE closure's count to 0 and free it (UAF). Include tag 10
+// here only together with the ownership fix and the clear_refs arm.
 static void dragon_list_box_traverse(void* obj, dragon_gc_visit_fn visit, void* arg) {
     auto* l = (DragonListBox*)obj;
     if (!l || !l->data || l->size == 0) return;
@@ -580,6 +592,21 @@ static void dragon_list_box_traverse(void* obj, dragon_gc_visit_fn visit, void* 
         int64_t v = l->data[i].payload;
         if (v && (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES))
             visit((void*)(uintptr_t)v, arg);
+    }
+}
+
+// Deque elements live in the circular window [head, head+size); elem_tag
+// drives the dispatch exactly like the list traverse (AUDIT-2026-07-09 Tier 4:
+// deques were invisible to the cycle collector - never tracked, no traverse,
+// no clear_refs - so a deque in a cycle leaked unconditionally).
+static void dragon_deque_traverse(void* obj, dragon_gc_visit_fn visit, void* arg) {
+    auto* d = (DragonDeque*)obj;
+    if (!d || !d->data || d->size == 0) return;
+    if (dragon_value_tag_is_traceable((int8_t)d->elem_tag)) {
+        for (int64_t i = 0; i < d->size; i++) {
+            int64_t v = d->data[(d->head + i) % d->capacity];
+            if (v) visit((void*)(uintptr_t)v, arg);
+        }
     }
 }
 
@@ -592,6 +619,7 @@ static void dragon_traverse(void* obj, dragon_gc_visit_fn visit, void* arg) {
         case DRAGON_TAG_DICT:  dragon_dict_traverse(obj, visit, arg); break;
         case DRAGON_TAG_TUPLE: dragon_tuple_traverse(obj, visit, arg); break;
         case DRAGON_TAG_SET:   dragon_set_traverse(obj, visit, arg); break;
+        case DRAGON_TAG_DEQUE: dragon_deque_traverse(obj, visit, arg); break;
         case DRAGON_TAG_CLASS: {
             uint16_t cid = h->class_id;
             if (cid > 0 && cid < DRAGON_MAX_CLASS_IDS && __class_traverse_table[cid])
@@ -757,10 +785,38 @@ static void dragon_list_box_clear_refs(void* obj) {
         } else if (v && (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)) {
             dragon_decref((void*)(uintptr_t)v);
         }
+        // No TAG_CLOSURE arm: the box does not own closure refs today - see
+        // the WALL note in dragon_listbox_decref_elem (runtime_list.cpp).
         l->data[i].payload = 0;
         l->data[i].tag = 0;
     }
     l->size = 0;
+}
+
+// Deque cycle-break over the circular window - mirrors dragon_list_clear_refs
+// (str force-free, heap decref, tag-gated closure decref), then empties the
+// window so the later dragon_deque_destroy (size now 0) can't re-release.
+static void dragon_deque_clear_refs(void* obj) {
+    auto* d = (DragonDeque*)obj;
+    if (!d || !d->data) return;
+    uint8_t tag = d->elem_tag;
+    for (int64_t i = 0; i < d->size; i++) {
+        int64_t idx = (d->head + i) % d->capacity;
+        int64_t v = d->data[idx];
+        if (v) {
+            if (tag == TAG_STR) {
+                // Tier 1.8: bypass gc_collecting guard - see list_clear_refs.
+                dragon_str_force_free_if_zero((const char*)(uintptr_t)v);
+            } else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES) {
+                dragon_decref((void*)(uintptr_t)v);
+            } else if (tag == DRAGON_TAG_CLOSURE) {
+                dragon_decref_callable((void*)(uintptr_t)v);  // tag-gated
+            }
+        }
+        d->data[idx] = 0;
+    }
+    d->size = 0;
+    d->head = 0;
 }
 
 static void dragon_clear_refs(void* obj) {
@@ -772,6 +828,7 @@ static void dragon_clear_refs(void* obj) {
         case DRAGON_TAG_DICT:  dragon_dict_clear_refs(obj); break;
         case DRAGON_TAG_TUPLE: dragon_tuple_clear_refs(obj); break;
         case DRAGON_TAG_SET:   dragon_set_clear_refs(obj); break;
+        case DRAGON_TAG_DEQUE: dragon_deque_clear_refs(obj); break;
         case DRAGON_TAG_CLASS: {
             uint16_t cid = h->class_id;
             if (cid > 0 && cid < DRAGON_MAX_CLASS_IDS && __class_clear_table[cid])
@@ -1185,6 +1242,14 @@ static void shared_walk_set(DragonSet* s, DragonSharedWorklist* w) {
         for (int64_t i = 0; i < s->capacity; i++)
             if (s->states[i] == 1 && s->buckets[i])
                 dragon_mark_shared_worklist_push(w, (void*)(uintptr_t)s->buckets[i]);
+    } else if (tag == DRAGON_TAG_CLOSURE) {
+        // set[Callable]: tag-gated (element may be a bare fn pointer). This arm
+        // was missing while every sibling walker had it (AUDIT-2026-07-09 Tier
+        // 4): an un-marked-SHARED closure in a set crossing threads did
+        // non-atomic refcounting - a torn-refcount / UAF-by-race class bug.
+        for (int64_t i = 0; i < s->capacity; i++)
+            if (s->states[i] == 1 && s->buckets[i])
+                dragon_mark_shared_callable(w, (void*)(uintptr_t)s->buckets[i]);
     }
 }
 
@@ -1302,6 +1367,105 @@ void dragon_mark_shared_boxed(int64_t tag, int64_t payload) {
         return;
     }
     if (tag >= TAG_LIST) dragon_mark_shared_deep((void*)(uintptr_t)payload);
+}
+
+//===----------------------------------------------------------------------===//
+// del: the debug executable assertion of the ownership proof (docs/002 ADR).
+//
+// The OwnershipCheck pass proved the deleted binding is the value's SOLE
+// owner, so its refcount must be exactly 1 at the del. Disagreement means a
+// codegen refcount bug (a leaked or double-taken reference) or an unannotated
+// callee that retained a borrow - either way the exact line is named instead
+// of costing an ASan A/B hunt. Debug builds only (-O0); release builds lower
+// del to the plain scope-exit release with no check.
+//===----------------------------------------------------------------------===//
+
+static void dragon_del_violation(const char* file, int64_t line, int64_t rc) {
+    fprintf(stderr,
+            "dragon: del at %s:%lld: refcount is %lld, not 1 - a reference "
+            "escaped the compiler's ownership proof (codegen refcount bug, or "
+            "a callee retained a borrowed argument)\n",
+            file ? file : "<unknown>", (long long)line, (long long)rc);
+    abort();
+}
+
+//===----------------------------------------------------------------------===//
+// dub (docs/002 2.7): the priced deep copy. Immutable payloads (str, bytes)
+// keep honest copy semantics with a free identity retain - no observer can
+// distinguish a shared immutable payload from a copied one. Mutable
+// containers copy their spine and deep-copy elements by tag. Every entry
+// returns an owned +1 (fresh object, or identity-retained immutable), so
+// consumers adopt exactly like any owned call result.
+//===----------------------------------------------------------------------===//
+
+/// Identity retain for header-carrying heap objects (bytes, tuples): the
+/// dub of an immutable is the object itself, +1. Mirrors dragon_str_retain's
+/// calls-return-owned convention.
+void* dragon_obj_retain(void* p) {
+    dragon_incref(p);
+    return p;
+}
+
+/// Deep-copy one element by its container tag; returns an owned +1 value.
+int64_t dragon_deep_copy_tagged(int64_t val, int64_t tag) {
+    if (!val) return val;
+    switch (tag) {
+        case TAG_STR:
+            dragon_incref_str((const char*)(uintptr_t)val);
+            return val;
+        case TAG_BYTES:  // immutable: identity
+            dragon_incref((void*)(uintptr_t)val);
+            return val;
+        case TAG_LIST:
+            return (int64_t)(uintptr_t)dragon_list_deep_copy(
+                (DragonList*)(uintptr_t)val);
+        case TAG_DICT:
+            return (int64_t)(uintptr_t)dragon_dict_deep_copy(
+                (DragonDict*)(uintptr_t)val);
+        default:
+            // Scalars carry no refs; anything else (closure etc.) is E11 at
+            // compile time - defensively share+retain rather than corrupt.
+            dragon_incref_tagged(val, (uint8_t)tag);
+            return val;
+    }
+}
+
+/// cls 0 = generic heap object (pointer IS the DragonObjectHeader base);
+/// cls 1 = string DATA pointer (header behind it; literals skipped).
+void dragon_del_assert_unique(void* p, int64_t cls, const char* file,
+                              int64_t line) {
+    if (!p) return;
+    int64_t rc;
+    if (cls == 1) {
+        const char* s = (const char*)p;
+        if (!dragon_str_is_heap(s)) return;  // literal: nothing to count
+        rc = dragon_string_from_data(s)->header.refcount;
+    } else {
+        rc = ((DragonObjectHeader*)p)->refcount;
+    }
+    if (rc >= DRAGON_IMMORTAL_REFCOUNT) return;  // immortal: exempt by design
+    if (rc != 1) dragon_del_violation(file, line, rc);
+}
+
+/// Boxed {tag, payload} variant: dispatch by runtime tag; scalar tags and
+/// bare-fn-ptr closures carry no refcount and are exempt.
+void dragon_del_assert_unique_box(int64_t tag, int64_t payload,
+                                  const char* file, int64_t line) {
+    if (!payload) return;
+    if (tag == TAG_STR) {
+        dragon_del_assert_unique((void*)(uintptr_t)payload, 1, file, line);
+        return;
+    }
+    if (tag == DRAGON_TAG_CLOSURE) {
+        DragonObjectHeader* h = (DragonObjectHeader*)(uintptr_t)payload;
+        if (h->type_tag != DRAGON_TAG_CLOSURE) return;  // bare fn ptr
+        int64_t rc = h->refcount;
+        if (rc < DRAGON_IMMORTAL_REFCOUNT && rc != 1)
+            dragon_del_violation(file, line, rc);
+        return;
+    }
+    if (tag >= TAG_LIST)
+        dragon_del_assert_unique((void*)(uintptr_t)payload, 0, file, line);
 }
 
 } // extern "C"

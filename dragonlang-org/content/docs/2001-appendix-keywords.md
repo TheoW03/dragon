@@ -134,11 +134,17 @@ plain identifier everywhere else. See [Templates](/docs/1201-templates).
 |---|---|
 | `template` | Opens a compile-time template block: `s: str = template {Hello !{name}}`. |
 
-## Other statements
+## Ownership
+
+Three keywords manage a value's lifetime at compile time. See
+[Ownership](/docs/1604-ownership) for the full model, including the three
+places they are **mandatory**.
 
 | Keyword | Meaning |
 |---|---|
-| `del` | Deletes a binding or a container entry: `del d["key"]`. |
+| `del` | Ends a value's life early: `del buf` frees the value on that line and compiles only when the compiler can prove `buf` is the sole owner (nothing aliased, stored, or captured it - otherwise the error names the escape). Locals only; using the name afterwards is a compile error. Mandatory to close the un-moved path of a conditional move. Also deletes a container entry (`del d["key"]`), a separate operation with no proof involved. |
+| `own` | Sole ownership. On a field (`own _ctx: TlsCtx`), the instance owns the value and the generated cleanup releases it when the instance dies - **mandatory** for fields holding raw resource types like `Lock` or engine handles. On a parameter and at the call site (`def f(own d: T)` / `f(own d)`, both ends required), it transfers ownership; the source name is dead after the call. |
+| `dub` | Explicit copy, the only way to mint a second independent owner: `mine: dict[str, str] = dub base`. The cost sits on the line you wrote. **Mandatory** to iterate a container the loop body mutates: `for x in dub xs { xs.remove(x) }`. Non-copyable types (`Lock`, handle-holding classes) refuse at compile time. |
 
 ## Constants
 

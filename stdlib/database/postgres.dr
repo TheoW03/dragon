@@ -132,6 +132,19 @@ def _query_value(query: str, key: str, fallback: str) -> str {
 
 
 class PgConnection(Connection) {
+    # TLS owners, assigned only by _maybe_tls (declared here so the fields
+    # exist and dispatch before TLS is enabled - guarded by tls_conn != none,
+    # mirroring Router._ssl_context). SSLContext owns the engine config,
+    # SSLSocket owns the conn; both must outlive tls_conn, the borrowed
+    # fast-path handle - the old code kept only the raw handle and relied on
+    # the owners leaking.
+    tls_ctx: SSLContext
+    tls_sock: SSLSocket
+    # Declared so the field's class is statically KNOWN: a ctor-inferred
+    # instance field (from TcpStream.open's result) loses its kind and the
+    # connection's dealloc skipped it - one leaked TcpStream per connection.
+    sock: TcpStream
+
     def(dsn: str) {
         # Parse postgres://user:password@host:port/dbname?params
         parts: SplitResult = urlsplit(dsn)
@@ -179,7 +192,7 @@ class PgConnection(Connection) {
         self._stmt_seq = 0                       # source of unique statement names
         self._rbuf = bytes()                     # socket read buffer
         self._rpos = 0                           # consumed offset into _rbuf
-        self.tls_conn = none           # set when the transport is TLS-wrapped
+        self.tls_conn = none           # BORROWED hot-path handle (see class head)
         self.sock = TcpStream.open(host, port)
         if sslmode != "disable" {
             self._maybe_tls(host, sslmode)
@@ -202,6 +215,10 @@ class PgConnection(Connection) {
             ctx: SSLContext = SSLContext(PROTOCOL_TLS_CLIENT)
             ctx.set_verify_mode(CERT_NONE)
             sslsock: SSLSocket = ctx.wrap_socket(self.sock, False, host, True)
+            # Keep the owners alive for the connection's lifetime; tls_conn
+            # is the borrowed fast-path handle for _send/_recv_chunk.
+            self.tls_ctx = ctx
+            self.tls_sock = sslsock
             self.tls_conn = sslsock.conn()
         } else {
             if sslmode == "require" {
@@ -588,12 +605,16 @@ class PgConnection(Connection) {
 
     def close() -> int {
         # Terminate ('X' = 88), then tear down TLS (if any) + the socket.
+        # SSLSocket.close() does the graceful close_notify, frees the conn
+        # exactly once (it nulls its own handle; the own release at death is
+        # null-gated), and closes the underlying TcpStream.
         self._send(_msg(88, bytes()))
         if self.tls_conn != none {
-            dragon_tls_close(self.tls_conn)
-            dragon_tls_conn_free(self.tls_conn)
+            self.tls_sock.close()
+            self.tls_conn = none
+        } else {
+            self.sock.close()
         }
-        self.sock.close()
         return 0
     }
 }

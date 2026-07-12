@@ -5,6 +5,7 @@
 /// Contains CodeGen::Impl struct definition shared across all codegen TUs.
 
 #include <execinfo.h>
+#include <limits>
 #include "dragon/CodeGen.h"
 #include "dragon/TypeChecker.h"
 #include "dragon/StdlibRegistry.h"
@@ -97,6 +98,15 @@ struct CodeGen::Impl {
         // in `detachableTaskDecls`; detach is idempotent with join (the `joined`
         // CAS), so it is safe even if a later edit adds a join.
         std::unordered_set<std::string> detachOnExit;
+        // docs/002 ADR 2.10: bare Lock LOCALS are owned by their scope and
+        // destroyed at scope exit (null-gated: a `del` nulls the slot, so a
+        // deleted lock is skipped). Statically sound because OwnershipCheck
+        // forbids every second-owner path for a raw resource: E8 refuses
+        // borrow stores into own fields, E15 makes resource fields own-only,
+        // E16 bans container elements, and plain call args only borrow.
+        // Module-level Locks are NOT armed (2.10: globals live for the
+        // process).
+        std::unordered_set<std::string> lockDestroyOnExit;
         // Exception-unwind cleanup (see DragonCleanupStack). cleanupSlots maps an
         // owned heap local's name -> the i32 alloca holding its runtime cleanup
         // slot index, so a reassignment can refresh the snapshot. cleanupBaseAlloca
@@ -215,6 +225,12 @@ struct CodeGen::Impl {
         llvm::Value* enterResult = nullptr;  // __enter__ result (class CMs); may == val
         bool isLockTemp = false;  // `with Lock()` - an anonymous lock the `with`
                                   // OWNS: destroy (not just release) it on exit.
+        bool subjectOwned = true;  // false when the subject expression is a
+                                   // BORROW (bound local / attribute / walrus):
+                                   // its slot owns the manager, so with-exit
+                                   // must NOT decref `val` (A/B-proven UAF,
+                                   // test_rc_with_subject.dr). The __enter__
+                                   // result's +1 is always the with's to drop.
     };
 
     // Unified exit-cleanup stack: a try/finally body OR a with-statement's
@@ -960,6 +976,17 @@ struct CodeGen::Impl {
 
     // GC Phase 4: per-function parameter VarKinds (for atomic incref at fire/async spawn)
     std::unordered_map<std::string, std::vector<VarKind>> funcParamKinds;
+    // docs/002 2.8: aligned with funcParamKinds (methods include self at 0) -
+    // true for `own p: T` params. The CALLER must not drain an owned temp
+    // bound to an own param: ownership TRANSFERRED, the callee's scope exit
+    // releases it (caller-drain + callee-release double-freed, A/B-proven by
+    // the fresh-temp-exemption probe).
+    std::unordered_map<std::string, std::vector<bool>> funcParamOwns;
+    bool paramIsOwn(const std::string& funcName, unsigned idx) {
+        auto it = funcParamOwns.find(funcName);
+        return it != funcParamOwns.end() && idx < it->second.size() &&
+               it->second[idx];
+    }
     // D027: per-function flags - param i is a `Callable[...]`. When a BARE
     // function is passed to such a param, the call site wraps it as
     // DragonClosure(fn, null) so the param always holds a real DragonClosure
@@ -975,6 +1002,20 @@ struct CodeGen::Impl {
     // buffer ptr) - so the call site must never release owned-temp arguments
     // passed to them.
     std::unordered_set<std::string> externFuncNames;
+    // FFI v0 ownership contract (AUDIT-2026-07-09 1.2): extern "C" args are
+    // BORROWED for the duration of the call (an extern must not retain a
+    // Dragon reference past return - an adopting extern would already corrupt
+    // named-local args, which are never increfed for externs), and a managed
+    // return (str/bytes/list/dict/set) is a FRESH +1 allocation, never an
+    // alias of an argument. Under that contract an owned heap temp passed to
+    // a managed-typed extern param drains after the call exactly like any
+    // borrow callee (stdlib http's nested dragon_str_concat calls leaked one
+    // string per header per response without this). A declared `ptr` RETURN
+    // opts the whole call out: the result may point INTO an argument
+    // (dragon_bytes_data), so its arg temps must outlive the call site
+    // (leak-over-UAF at the FFI edge). Members: externs whose declared return
+    // is not `ptr` - the ones whose owned arg temps are safe to drain.
+    std::unordered_set<std::string> externDrainableFuncs;
 
     // Default parameter values: funcName -> vector of Expr* (one per LLVM param,
     // nullptr for params without defaults). Used at call sites to fill missing args.
@@ -1257,6 +1298,16 @@ struct CodeGen::Impl {
     /// with this tag, then resets to -1. Set by AnnAssignStmt when RHS is dict access.
     int64_t pendingDictCheckTag = -1;
 
+    /// Companion to pendingDictCheckTag for LIST-annotated LHS: the
+    /// dragon_list_view_check argument (see listViewWantElemTag). The dict
+    /// checked-get verifies the stored TAG is "list" (5) but cannot tell a
+    /// monomorphized DragonList from a DragonListBox - the consuming get site
+    /// emits the view check on the returned pointer so `xs: list[int] =
+    /// anyDict["k"]` raises TypeError instead of misreading a list[str]'s
+    /// pointers as ints. Captured and cleared together with
+    /// pendingDictCheckTag at the get sites.
+    int64_t pendingListViewElemTag = kNoListElemCheck;
+
     /// D030 Phase 3.G: resolve the static key Type::Kind of a dict that
     /// `expr` evaluates to. Used by subscript/`in`/print sites to branch
     /// between str-keyed (default) and int-keyed dispatch. Returns
@@ -1474,6 +1525,22 @@ struct CodeGen::Impl {
     /// null in non-RC / terminated block). Pair with emitCleanupPopTemp.
     llvm::Value* emitCleanupPushTemp(llvm::Value* ptr, int cleanupKind);
 
+    /// Register owned arg temps on the runtime cleanup stack for the duration
+    /// of a call, so a raise that longjmps out of the callee frees them (the
+    /// post-call decref only runs on normal return; without this an owned temp
+    /// like the bytes literal in `assertRaises(..., lambda: f(b"x"))` leaked
+    /// whenever the callee raised - AUDIT-2026-07-09 1.9). Returns the per-temp
+    /// rewind bases for popArgTempCleanups on the normal-return path. Only
+    /// tag-independent kinds (Str/Callable/Obj) are registered - a Union temp
+    /// needs a box value-tag the temp-cleanup path doesn't carry, so it stays
+    /// with the existing normal-path decref.
+    std::vector<llvm::Value*> pushArgTempCleanups(
+        const std::vector<std::pair<llvm::Value*, VarKind>>& argTemps);
+
+    /// Rewind (does NOT free) the cleanup entries pushed by pushArgTempCleanups,
+    /// in reverse push order, on the normal-return path before the decref.
+    void popArgTempCleanups(const std::vector<llvm::Value*>& bases);
+
     /// Rewind the cleanup stack past a temp pushed by emitCleanupPushTemp - call
     /// at the loop's normal-exit decref site, where codegen already freed the
     /// temp, so a later unwind doesn't double-free the now-stale snapshot.
@@ -1544,7 +1611,8 @@ struct CodeGen::Impl {
                     if (it.isClassCtx) {
                         callDunder(it.className, "__exit__", it.val);
                         if (options.gcMode == GCMode::RC) {   // release the CM object (#8)
-                            builder->CreateCall(runtimeFuncs["dragon_decref"], {it.val});
+                            if (it.subjectOwned)
+                                builder->CreateCall(runtimeFuncs["dragon_decref"], {it.val});
                             if (it.enterResult && it.enterResult->getType()->isPointerTy())
                                 builder->CreateCall(runtimeFuncs["dragon_decref"], {it.enterResult});
                         }
@@ -1778,10 +1846,93 @@ struct CodeGen::Impl {
             if (sub->object && sub->object->type &&
                 sub->object->type->kind() == Type::Kind::Str)
                 return false;
+            // A DICT element read whose receiver is itself a CALL
+            // (`r.info()["k"]`, `cfg.get("db")["host"]`): the receiver is an
+            // owned temp the read consumes, and the lowering
+            // (retainElemThenReleaseRecv in Attributes.cpp) retains the
+            // element by kind before releasing it - handing the consumer an
+            // owned +1, the mirror of the f().attr rule below. Only the
+            // concrete-heap element branches retain (Any/Union box reads and
+            // closure elements keep today's borrow story), so the owned
+            // classification is gated the same way.
+            if (sub->object && dynamic_cast<CallExpr*>(sub->object.get()) &&
+                sub->object->type &&
+                sub->object->type->kind() == Type::Kind::Dict && expr->type) {
+                switch (expr->type->kind()) {
+                    case Type::Kind::Str:
+                    case Type::Kind::Bytes:
+                    case Type::Kind::List:
+                    case Type::Kind::Dict:
+                    case Type::Kind::Set:
+                    case Type::Kind::Tuple:
+                    case Type::Kind::Instance:
+                        return false;
+                    default: break;
+                }
+            }
             return true;
         }
-        return dynamic_cast<NameExpr*>(expr) != nullptr ||
-               dynamic_cast<AttributeExpr*>(expr) != nullptr;
+        // A walrus target slot ADOPTS its value's +1 (the store site passes
+        // rhsBorrowed=false and skips the incref), so the expression hands its
+        // consumer a BORROW of the slot's value - exactly like reading the
+        // name. Classifying it owned made a call site drain `takes(x := ...)`
+        // while x still held the same pointer (A/B-proven use-after-free,
+        // test_rc_walrus.dr).
+        if (dynamic_cast<WalrusExpr*>(expr) != nullptr) return true;
+        if (auto* nm = dynamic_cast<NameExpr*>(expr)) {
+            // `own x` at a consuming position (docs/002 2.8): the binding's
+            // +1 TRANSFERS - an owned value by definition, never a borrow.
+            // The consumer adopts (no incref) and the move-out nulls the
+            // source slot, so the single reference stays single.
+            // `dub x` (2.7) likewise hands its consumer a fresh owned +1
+            // (deep copy / identity retain) - never a borrow.
+            return !nm->isMoveMarked && !nm->isDubMarked;
+        }
+        if (auto* at = dynamic_cast<AttributeExpr*>(expr)) {
+            // `f().attr`: the receiver is an owned temp the read consumes;
+            // the lowering (Attributes.cpp) RETAINS the field by kind and
+            // releases the receiver, handing the consumer an owned +1 - so
+            // an attr-on-a-CALL is NOT a borrow. A field read off a named
+            // object stays borrowed as ever.
+            return !dynamic_cast<CallExpr*>(at->object.get());
+        }
+        return false;
+    }
+
+    /// docs/002 moves: after a call consumed `f(own x)` arguments, null each
+    /// moved-out binding's slot. The callee adopted the caller's +1, so the
+    /// caller's scope-exit release must see nothing (decref of null no-ops;
+    /// the Lock scope-destroy is null-gated). E9-at-join guarantees every
+    /// path agrees, so this is bookkeeping, not a runtime drop flag.
+    void emitNullSlot(llvm::AllocaInst* alloca) {
+        if (alloca->getAllocatedType() == boxType)
+            builder->CreateStore(llvm::Constant::getNullValue(boxType), alloca);
+        else if (alloca->getAllocatedType()->isPointerTy())
+            builder->CreateStore(
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(alloca->getAllocatedType())),
+                alloca);
+        else
+            builder->CreateStore(
+                llvm::ConstantInt::get(alloca->getAllocatedType(), 0), alloca);
+    }
+
+    /// Move-out for one value expression (an own-field store RHS): if it is
+    /// `own x`, null x's slot - the field adopted the +1.
+    void emitMoveOutIfMarked(Expr* value) {
+        if (options.gcMode != GCMode::RC || !value) return;
+        auto* nm = dynamic_cast<NameExpr*>(value);
+        if (!nm || !nm->isMoveMarked) return;
+        if (auto* alloca = lookupVar(nm->name)) emitNullSlot(alloca);
+    }
+
+    void emitMoveOutSlots(CallExpr& node) {
+        if (options.gcMode != GCMode::RC) return;
+        for (auto& a : node.args) {
+            auto* nm = dynamic_cast<NameExpr*>(a.get());
+            if (!nm || !nm->isMoveMarked) continue;
+            if (auto* alloca = lookupVar(nm->name)) emitNullSlot(alloca);
+        }
     }
 
     // setdefault key ownership (#20a): a NEW str-keyed insert stores the key by
@@ -1819,7 +1970,16 @@ struct CodeGen::Impl {
     void emitDecrefByKind(llvm::Value* val, VarKind kind) {
         if (options.gcMode != GCMode::RC) return;
         if (!isHeapKind(kind)) return;
-        if (kind == VarKind::Union) return;  // unions use tag-based RC
+        if (kind == VarKind::Union) {
+            // A Union value is a {tag, payload} box VALUE, not a pointer:
+            // extract and release by runtime tag (no-op for scalar tags and
+            // the zero-initialized {0, 0} box). Mirrors emitIncrefByKind so
+            // the two by-kind entry points share one ownership story.
+            if (val && val->getType() == boxType)
+                emitUnionDecref(boxPayloadI64(val, "u.dec.p"),
+                                boxTag(val, "u.dec.t"));
+            return;
+        }
         auto* ptr = toI8Ptr(val);
         if (!ptr) return;
         if (kind == VarKind::Str) {
@@ -1848,22 +2008,43 @@ struct CodeGen::Impl {
     ///  - Union/box params manage RC by tag; left to the box machinery.
     VarKind argTempDecrefKind(Expr* argExpr, VarKind paramKind, llvm::Value* rawVal) {
         if (options.gcMode != GCMode::RC) return VarKind::Other;
-        // A Union/Any param returns Other ON PURPOSE - the boxed path is NOT
-        // drained here, and the fix is NOT a refcount patch (leaks.md #3 class B).
-        // An owned heap temp boxed into an Any param has AMBIGUOUS ownership the
-        // call site cannot resolve: an Any FIELD store TRANSFERS (the field adopts
-        // the temp's +1 - balanced, no leak), while a borrow callee just reads it
-        // (the temp leaks). Draining uniformly fixes the borrow case but
-        // DOUBLE-FREES the retain-into-field case (A/B-proven heap-use-after-free
-        // in __dragon_dealloc_<Class>). The two need opposite handling and the
-        // caller can't tell which statically - because the box threw the type
-        // away. The Zen-aligned fix is to MONOMORPHIZE the spurious-Any param into
-        // a generic [T]: the value then flows NATIVE (no box), and the typed-param
-        // drain below handles it with compile-time-known ownership and zero
-        // boxing. assertEqual[T] is the model. Boxing stays only for the genuinely
-        // dynamic, where ownership is a compile-time escape property, not a
-        // runtime guess. Until a param is monomorphized, leak > UAF here.
-        if (!isHeapKind(paramKind) || paramKind == VarKind::Union)
+        if (paramKind == VarKind::Union) {
+            // Union/Any params now take the SAME callee-borrows contract as
+            // every typed param: the callee retains by increfing (the Union
+            // arm of emitIncrefByKind fires on field stores / return aliases
+            // via storeWithRCOverwrite), so the caller's owned temp is always
+            // the caller's to drain. History: this used to return Other ON
+            // PURPOSE because an Any FIELD store adopted the temp's +1
+            // without incref - ownership was genuinely ambiguous at the call
+            // site and draining double-freed the retain case (A/B-proven
+            // heap-use-after-free in __dragon_dealloc_<Class>). That adopt
+            // asymmetry is fixed at the root, the old failure is pinned by
+            // test_rc_any_field.dr, and the ambiguity is gone. Monomorphizing
+            // spurious-Any params into generics [T] remains the better fix
+            // where the concrete type is knowable (zen: types are honest);
+            // this drain covers the genuinely dynamic remainder.
+            // A PROVABLY-OWNED box result (dragon_box_subscript / dragon_box_binop
+            // / an Any-returning call) carries a +1 the callee borrows, so it must
+            // be drained even when the SOURCE EXPRESSION reads as borrowed: a
+            // subscript on an Any value lowers to dragon_box_subscript (OWNED +1),
+            // but isBorrowedHeapExpr classifies every list/dict subscript borrowed
+            // for the typed-container element-read case. isOwnedBoxResult is
+            // value-based and precise - the borrowed-box returners (dict_get_box /
+            // dict_int_get_box / list_box_get) are isOwnedBoxResult=false, so a
+            // BORROWED element read (dict[str,Any] / list[Any], the hot path in a
+            // parsed-JSON server) is still NOT drained (the container keeps the +1;
+            // draining it would double-free). Ordered BEFORE the isBorrowedHeapExpr
+            // gate so the owned-subscript +1 is not lost to the borrowed-subscript
+            // classification (was: leaked one payload per `f(anyVal[k])`).
+            if (rawVal && rawVal->getType() == boxType)
+                return isOwnedBoxResult(rawVal) ? VarKind::Union : VarKind::Other;
+            if (isBorrowedHeapExpr(argExpr)) return VarKind::Other;
+            // Owned NATIVE heap temp boxed at the boundary (concat, ctor,
+            // slice, ... into `x: Any`): the box borrows the payload, so the
+            // native +1 is drained by the temp's own static type.
+            return ownedTempDrainKind(argExpr, rawVal);
+        }
+        if (!isHeapKind(paramKind))
             return VarKind::Other;
         if (isBorrowedHeapExpr(argExpr)) return VarKind::Other;
         if (paramKind == VarKind::Str && !isOwnedStrResult(rawVal))
@@ -1873,17 +2054,30 @@ struct CodeGen::Impl {
 
     // Classify one PRE-coerce call argument and, if it is an owned heap temporary
     // the callee borrows, record it in `out` for release after the call. Skips
-    // extern-C callees (no RC convention at the FFI edge) and anything
-    // argTempDecrefKind rejects (borrowed expr / str literal / scalar / union).
+    // ptr-returning extern-C callees (interior-pointer hazard at the FFI edge;
+    // see externDrainableFuncs) and anything argTempDecrefKind rejects
+    // (borrowed expr / str literal / scalar).
     // The single place direct-call sites (cross-module fn, module-attr ctor,
     // static methods, ...) route owned-temp tracking through (#3, class A).
     void collectArgTemp(const std::string& funcName, Expr* srcExpr,
                         llvm::Value* rawArg, unsigned paramIdx,
                         std::vector<std::pair<llvm::Value*, VarKind>>& out) {
         if (options.gcMode != GCMode::RC) return;
-        if (externFuncNames.count(funcName)) return;
+        if (externFuncNames.count(funcName)) {
+            // A ptr-returning extern is not drainable (interior-pointer hazard).
+            // A drainable extern is classified by the ARG's own static type,
+            // never the declared param kind (the same C symbol can carry
+            // disagreeing arg types across modules - AUDIT-2026-07-09 postgres
+            // UAF), so route through ownedTempDrainKind.
+            if (!externDrainableFuncs.count(funcName)) return;
+            VarKind dk = ownedTempDrainKind(srcExpr, rawArg);
+            if (dk != VarKind::Other) out.emplace_back(rawArg, dk);
+            return;
+        }
         auto it = funcParamKinds.find(funcName);
         if (it == funcParamKinds.end() || paramIdx >= it->second.size()) return;
+        // An own param ADOPTS the +1 (fresh-temp exemption): no caller drain.
+        if (paramIsOwn(funcName, paramIdx)) return;
         VarKind dk = argTempDecrefKind(srcExpr, it->second[paramIdx], rawArg);
         if (dk != VarKind::Other) out.emplace_back(rawArg, dk);
     }
@@ -2536,8 +2730,23 @@ struct CodeGen::Impl {
                               Expr* rExpr, llvm::Value* rhs, int64_t opcode) {
         llvm::Value* boxA = boxNativeOperand(cg, lExpr, lhs);
         llvm::Value* boxB = boxNativeOperand(cg, rExpr, rhs);
-        return builder->CreateCall(runtimeFuncs["dragon_box_binop"],
+        llvm::Value* res = builder->CreateCall(runtimeFuncs["dragon_box_binop"],
             {boxA, boxB, llvm::ConstantInt::get(i64Type, opcode)}, "box.binop");
+        drainOwnedNativeBoxOperands(lhs, rhs);
+        return res;
+    }
+
+    // boxNativeOperand borrows - the box only reads the payload. A native ptr
+    // operand that is itself an owned temp (fresh call result / bytes literal)
+    // is orphaned once the runtime call returns, so drain it here. Names and
+    // field reads are loads, not calls - isOwnedPtrResult screens them out.
+    void drainOwnedNativeBoxOperands(llvm::Value* lhs, llvm::Value* rhs) {
+        if (options.gcMode != GCMode::RC) return;
+        for (llvm::Value* v : {lhs, rhs}) {
+            if (v->getType() != boxType && v->getType()->isPointerTy() &&
+                isOwnedPtrResult(v))
+                builder->CreateCall(runtimeFuncs["dragon_decref"], {v});
+        }
     }
 
     // Emit dragon_box_cmp(boxA, boxB, cmpOp) for an ordering operator where at
@@ -2548,17 +2757,37 @@ struct CodeGen::Impl {
                             Expr* rExpr, llvm::Value* rhs, int64_t cmpOp) {
         llvm::Value* boxA = boxNativeOperand(cg, lExpr, lhs);
         llvm::Value* boxB = boxNativeOperand(cg, rExpr, rhs);
-        return builder->CreateCall(runtimeFuncs["dragon_box_cmp"],
+        llvm::Value* res = builder->CreateCall(runtimeFuncs["dragon_box_cmp"],
             {boxA, boxB, llvm::ConstantInt::get(i64Type, cmpOp)}, "box.cmp");
+        drainOwnedNativeBoxOperands(lhs, rhs);
+        return res;
     }
+
+    // Sentinel for `wantListElemTag`: skip the list representation check.
+    static constexpr int64_t kNoListElemCheck =
+        std::numeric_limits<int64_t>::min();
 
     // Unbox a dragon_box_binop result into `targetType` (a native slot type),
     // emitting a runtime tag-check that raises TypeError (code 80) on mismatch.
     // Mirrors the D039 Phase-7a inline unbox in AnnAssign. If targetType IS the
     // box type, returns the box unchanged (Any slot). Leaves the builder at the
     // ok-path continuation block.
+    // `wantListElemTag` (when not kNoListElemCheck) additionally emits
+    // dragon_list_view_check on a list-tagged payload: the box tag alone says
+    // "some list" but cannot distinguish a monomorphized DragonList from a
+    // DragonListBox - reading one at the other's stride corrupts silently.
+    // Pass -1 for a list[Any]/list[union] target (requires a box list), an
+    // element tag >= 0 for a concrete list[T] target.
     llvm::Value* unboxBoxResultChecked(llvm::Value* box, llvm::Type* targetType,
-                                       VarKind vk);
+                                       VarKind vk,
+                                       int64_t wantListElemTag = kNoListElemCheck);
+
+    /// The dragon_list_view_check argument for a list-typed slot, derived from
+    /// its annotation: -1 for list[Any] / list[union] (box representation), a
+    /// concrete element tag for monomorphized element types, kNoListElemCheck
+    /// when the annotation is not a checkable list shape (bare `list`,
+    /// `list[type]` descriptor lists, type variables, ...).
+    int64_t listViewWantElemTag(TypeExpr* ann);
 
     /// Convert a raw i64 container slot (as returned by dragon_tuple_get /
     /// dragon_list_get) to the native LLVM value for `elemType`. Mirrors the

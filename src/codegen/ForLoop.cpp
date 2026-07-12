@@ -289,8 +289,14 @@ void CodeGen::visit(ForStmt& node) {
                     impl_->runtimeFuncs["dragon_exc_get_msg"], {}, "reraise.msg");
                 // Preserve the in-flight instance pointer too - see the matching
                 // RaiseStmt reraise path. obj=NULL when only a message was raised.
+                // Retained: the obj-raise consumes a +1; the same-pointer fold
+                // in dragon_exc_obj_set nets it out.
                 auto* reObj = impl_->builder->CreateCall(
-                    impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj");
+                    impl_->runtimeFuncs["dragon_exc_retain_obj"],
+                    {impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_exc_get_obj"], {},
+                        "reraise.obj.raw")},
+                    "reraise.obj");
                 // The generator body raised and longjmp'd out of mco_resume,
                 // abandoning the coroutine mid-run (MCO_RUNNING) with minicoro's
                 // running-coroutine pointer left dangling at it. Restore that
@@ -414,16 +420,21 @@ void CodeGen::visit(ForStmt& node) {
                 }
             }
             auto* loopVar = impl_->createEntryAlloca(func, targetName->name, loopVarType);
+            // Zero-init: the first iteration's RC-overwrite (below) loads the
+            // previous element before storing - a null previous no-ops.
+            impl_->emitNullSlot(loopVar);
             impl_->setVar(targetName->name, loopVar, loopVarKind);
             if (!loopVarClassName.empty())
                 impl_->varClassNames[targetName->name] = loopVarClassName;
-            // The __next__ result is borrowed from the iterator's storage in
-            // the common case (yield returns a shared field). Mark the loop
-            // var borrowed for heap kinds so per-iteration scope cleanup
-            // doesn't decref a value the iterator still owns - matches the
-            // generator yield convention applied earlier in this file.
-            if (Impl::isHeapKind(loopVarKind))
-                impl_->scopes.back().borrowed.insert(targetName->name);
+            // The __next__ result is a real method CALL, and Dragon method
+            // returns are OWNED (+1): ReturnStmt increfs a borrowed return
+            // (a shared-field `return self.items[i]` included), so the loop
+            // variable owns each element and the per-iteration scope cleanup
+            // is exactly the right release. The previous borrowed-marking
+            // (copied from the GENERATOR yield convention, which is a
+            // different machinery) leaked one element per iteration - every
+            // line of `for line in open(p)` (A/B-proven, both shapes:
+            // fresh-returning and shared-field-returning __next__).
 
             // Store iterator and register for GC cleanup on all exit paths.
             // Unique scope name per loop so a sibling for-loop's setVar can't
@@ -468,6 +479,16 @@ void CodeGen::visit(ForStmt& node) {
             impl_->builder->SetInsertPoint(nextBB);
             auto* nextVal = impl_->callDunder(iterClassName, "__next__", iterObj);
             impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_exc_pop_frame"], {});
+            // RC overwrite: the loop var OWNS each element (a method return
+            // is +1), so release the previous iteration's element before
+            // storing the next - a plain store orphaned every element but
+            // the last (A/B-proven; the slot starts null, decref no-ops).
+            if (impl_->options.gcMode == GCMode::RC &&
+                Impl::isHeapKind(loopVarKind)) {
+                auto* prevVal = impl_->builder->CreateLoad(
+                    loopVarType, loopVar, "iter.prev");
+                impl_->emitDecrefByKind(prevVal, loopVarKind);
+            }
             impl_->builder->CreateStore(nextVal, loopVar);
             impl_->builder->CreateBr(bodyBB);
 
@@ -495,8 +516,13 @@ void CodeGen::visit(ForStmt& node) {
                 // re-raise's self-store no-op keeps it. See matching site above.
                 auto* reMsg = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_exc_get_msg"], {}, "reraise.msg");
+                // Retained slot re-raise (same-pointer fold nets it out).
                 auto* reObj = impl_->builder->CreateCall(
-                    impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj");
+                    impl_->runtimeFuncs["dragon_exc_retain_obj"],
+                    {impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_exc_get_obj"], {},
+                        "reraise.obj.raw")},
+                    "reraise.obj");
                 impl_->emitAllScopeCleanup();
                 impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_raise_exc_obj"], {reType, reObj, reMsg});
@@ -650,8 +676,16 @@ void CodeGen::visit(ForStmt& node) {
         } else {
             // for k in d - evaluate dict, then call dragon_dict_keys
             node.iterable->accept(*this);
+            llvm::Value* dictVal = impl_->lastValue;
             iterableVal = impl_->builder->CreateCall(
-                impl_->runtimeFuncs["dragon_dict_keys"], {impl_->lastValue}, "dictkeys");
+                impl_->runtimeFuncs["dragon_dict_keys"], {dictVal}, "dictkeys");
+            // An OWNED dict temp (a `dub d` snapshot, a call result): the
+            // keys list is independent (fresh list, retained keys), so the
+            // temp is fully consumed here - release it or it leaks per loop.
+            Impl::VarKind rd =
+                impl_->ownedTempDrainKind(node.iterable.get(), dictVal);
+            if (rd != Impl::VarKind::Other)
+                impl_->emitDecrefByKind(dictVal, rd);
         }
     } else if (isDictItemsIterable) {
         // d.items() - evaluate the call (returns DragonList* of DragonTuple*)

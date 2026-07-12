@@ -412,6 +412,32 @@ itself a green thread). The `Task[int]` binding annotation is mandatory -
 `t = fire work()` is rejected, because types are never inferred into a
 bare `=`. See [Concurrency](/docs/1101-green-threads).
 
+## `del` proves; `own` and `dub` are new
+
+Python's `del x` unbinds a name, and the object quietly lives on if anything
+else references it. Dragon's `del x` is the same shape with a stronger
+promise: it compiles only when the compiler can *prove* `x` is the value's
+sole owner, frees the value on that line, and makes any later use of the name
+a compile error. If something aliased, stored, or captured the value, the
+error names where - which turns `del` into a lifetime probe, not just a
+statement. (`del d["key"]` on a container entry works exactly as in Python.)
+
+Two keywords have no Python counterpart:
+
+- `own` - sole ownership. On a field it means "this value dies with the
+  instance, released automatically"; on a parameter and at the call site
+  (`def f(own d: T)` / `f(own d)`) it transfers ownership and the source name
+  is dead afterwards.
+- `dub` - an explicit copy, the only way to mint a second independent owner.
+  Where Python copies implicitly or aliases silently, Dragon makes the copy a
+  visible, greppable word.
+
+Three places they are mandatory, all compile errors with named fixes: a field
+holding a `Lock` or other raw resource must be `own`; a value moved on one
+branch must be consumed (`del`) on the others; a container mutated inside its
+own `for` loop must be iterated as `for x in dub xs`. The full model is
+[Ownership](/docs/1604-ownership).
+
 ## What carries over unchanged
 
 A reassuring amount. If you already know Python, this is muscle memory:

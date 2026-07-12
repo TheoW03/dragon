@@ -92,7 +92,20 @@ void CodeGen::Impl::fillDefaultArgs(const std::string& funcName, llvm::Function*
 void CodeGen::Impl::emitIncrefByKind(llvm::Value* val, VarKind kind) {
         if (options.gcMode != GCMode::RC) return;
         if (!isHeapKind(kind)) return;
-        if (kind == VarKind::Union) return;  // unions use tag-based RC
+        if (kind == VarKind::Union) {
+            // A Union value is a {tag, payload} box VALUE: incref the payload
+            // by runtime tag (no-op for scalar tags). This is the retain half
+            // of the callee-borrows contract for Any: a field store / return
+            // alias of a borrowed box takes its OWN ref here, so the caller's
+            // post-call drain of an owned temp can never free a retained
+            // payload (A/B-proven use-after-free in __dragon_dealloc_<Class>,
+            // test_rc_any_field.dr). Silently no-oping instead left one ref
+            // with two owners.
+            if (val && val->getType() == boxType)
+                emitUnionIncref(boxPayloadI64(val, "u.inc.p"),
+                                boxTag(val, "u.inc.t"));
+            return;
+        }
         auto* ptr = toI8Ptr(val);
         if (!ptr) return;
         if (kind == VarKind::Str) {
@@ -294,8 +307,11 @@ void CodeGen::Impl::storeWithRCOverwrite(llvm::Value* slotPtr, llvm::Type* slotV
         // (AllocaInst slots only - module globals live forever and are never
         // scope-cleaned). A heap oldKind means this is a reassignment of an
         // already-registered local (refresh); a non-heap oldKind is a fresh
-        // declaration (push). Union is handled at its own store site (it carries
-        // a box tag and never routes through here). See DragonCleanupStack.
+        // declaration (push). Union LOCALS are handled at their own store site;
+        // Union FIELD stores route through here (box-typed slot, non-alloca)
+        // and get their tag-dispatched incref/decref from the by-kind helpers
+        // above, but are excluded from local cleanup registration below.
+        // See DragonCleanupStack.
         if (options.gcMode == GCMode::RC && !name.empty() &&
             isHeapKind(newKind) && newKind != VarKind::Union &&
             llvm::isa<llvm::AllocaInst>(slotPtr)) {
@@ -679,7 +695,7 @@ llvm::Value* CodeGen::Impl::boxPayloadAsKind(llvm::Value* box, VarKind k) {
     }
 
 llvm::Value* CodeGen::Impl::unboxBoxResultChecked(llvm::Value* box, llvm::Type* targetType,
-                                   VarKind vk) {
+                                   VarKind vk, int64_t wantListElemTag) {
         if (targetType == boxType) return box;
         int64_t expectedTag = -1;
         const char* tagName = "value";
@@ -712,7 +728,49 @@ llvm::Value* CodeGen::Impl::unboxBoxResultChecked(llvm::Value* box, llvm::Type* 
              builder->CreateGlobalString(msg)});
         builder->CreateUnreachable();
         builder->SetInsertPoint(okBB);
-        return boxPayloadAsKind(box, vk);
+        llvm::Value* out = boxPayloadAsKind(box, vk);
+        // The list box tag (5) cannot distinguish a monomorphized DragonList
+        // from a DragonListBox; verify the payload's HEADER matches the
+        // target's element representation before it is used at that stride.
+        if (expectedTag == 5 && wantListElemTag != kNoListElemCheck)
+            builder->CreateCall(runtimeFuncs["dragon_list_view_check"],
+                {out, llvm::ConstantInt::get(i64Type, wantListElemTag)});
+        return out;
+    }
+
+int64_t CodeGen::Impl::listViewWantElemTag(TypeExpr* ann) {
+        auto* g = dynamic_cast<GenericTypeExpr*>(ann);
+        if (!g || g->typeArgs.size() != 1) return kNoListElemCheck;
+        auto* base = dynamic_cast<NamedTypeExpr*>(g->base.get());
+        if (!base || (base->name != "list" && base->name != "List"))
+            return kNoListElemCheck;
+        // `list[type]` holds native i64 class-descriptor handles - not a
+        // checkable runtime list shape.
+        if (auto* n = dynamic_cast<NamedTypeExpr*>(g->typeArgs[0].get()))
+            if (n->name == "type") return kNoListElemCheck;
+        if (dynamic_cast<UnionTypeExpr*>(g->typeArgs[0].get()))
+            return -1;  // list[A | B] uses the box representation
+        Type::Kind k = typeExprToTypeKind(g->typeArgs[0].get());
+        switch (k) {
+            case Type::Kind::Any:
+            case Type::Kind::Union:
+            case Type::Kind::Optional:
+                return -1;  // box representation
+            case Type::Kind::Int:
+            case Type::Kind::Str:
+            case Type::Kind::Bool:
+            case Type::Kind::Float:
+            case Type::Kind::List:
+            case Type::Kind::Dict:
+            case Type::Kind::Bytes:
+            case Type::Kind::Set:
+            case Type::Kind::Tuple:
+            case Type::Kind::Instance:
+            case Type::Kind::Function:
+                return typeKindToElemTag(k);
+            default:
+                return kNoListElemCheck;
+        }
     }
 
 std::pair<llvm::Value*, llvm::Value*> CodeGen::Impl::boxArgTagPayload(
@@ -730,7 +788,16 @@ std::pair<llvm::Value*, llvm::Value*> CodeGen::Impl::boxArgTagPayload(
                 int64_t litTag = -1;
                 if (auto* cT = llvm::dyn_cast<llvm::ConstantInt>(tagV))
                     litTag = cT->getSExtValue();
-                if (litTag == 1)
+                // Promote a str literal to a heap dup ONLY when the consumer
+                // adopts it (takesOwnership: the dup's +1 transfers to the
+                // container, Model B). A borrow-only box (an Any param via
+                // coerceArgFromExpr, remove's equality search) keeps the
+                // rodata literal pointer as payload: every runtime TAG_STR
+                // path validates heap-ness first (dragon_incref_str /
+                // decref_str no-op, dragon_str_eq / string_len fall back to
+                // strlen), and a dup here has no owner to free it - it leaked
+                // one string per assertEqual(x, "lit") call.
+                if (litTag == 1 && takesOwnership)
                     val = ensureHeapString(val, argExpr);
                 if (takesOwnership && options.gcMode == GCMode::RC &&
                     isBorrowedHeapExpr(argExpr)) {

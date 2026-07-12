@@ -840,6 +840,7 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
         }();
         if (strHandled) {
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
             if (ownedStrRecv)
                 impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_decref_str"], {obj});
@@ -968,6 +969,7 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
         }();
         if (bytesHandled) {
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
             if (ownedBytesRecv)
                 impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_decref"], {obj});
@@ -1046,6 +1048,18 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
     if (isList) {
         attr.object->accept(*this);
         llvm::Value* obj = impl_->lastValue;
+        // An owned list RECEIVER temp (make().count(1), slice-then-method) is
+        // consumed by the call and leaked once per evaluation without a drain
+        // (AUDIT-2026-07-09 1.8) - the str path has always done this (see
+        // ownedStrRecv above). Drained at the tail, gated on an allow-list of
+        // methods that cannot hand out a borrow into the receiver
+        // (void / scalar / transfer / fresh results only).
+        bool ownedListRecv = impl_->options.gcMode == GCMode::RC &&
+                             !Impl::isBorrowedHeapExpr(attr.object.get()) &&
+                             impl_->isOwnedPtrResult(obj);
+        static const std::set<std::string> kListRecvDrainOk = {
+            "append", "insert", "extend", "remove", "clear", "sort",
+            "reverse", "count", "index", "pop", "copy"};
         // Owned heap temporaries materialized for a BORROW-method arg slot
         // (xs.remove(a+b), xs.index(x+y), xs.extend(make())). The transfer
         // methods append/insert deliberately do NOT track - they adopt the +1
@@ -1084,6 +1098,12 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                 }
             }
             if (!appendedClassName.empty()) {
+                // Track the element class for later attribute access - but
+                // NEVER clobber a declared list[Any] receiver: overwriting its
+                // elem kind with Instance re-routed this append (and every
+                // later element op) from the box-list runtime to
+                // dragon_list_append_ptr on a DragonListBox - an ASan
+                // heap-buffer-overflow (`l: list[Any] = []; l.append(Thing())`).
                 if (auto* listAttr = dynamic_cast<AttributeExpr*>(attr.object.get())) {
                     if (auto* listObj = dynamic_cast<NameExpr*>(listAttr->object.get())) {
                         std::string ownerClass;
@@ -1094,13 +1114,27 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                             if (vit != impl_->varClassNames.end()) ownerClass = vit->second;
                         }
                         if (!ownerClass.empty()) {
-                            impl_->classFieldListElemKinds[ownerClass][listAttr->attribute] = Type::Kind::Instance;
-                            impl_->classFieldListElemClassName[ownerClass][listAttr->attribute] = appendedClassName;
+                            auto ckIt = impl_->classFieldListElemKinds.find(ownerClass);
+                            bool fieldIsAny = false;
+                            if (ckIt != impl_->classFieldListElemKinds.end()) {
+                                auto fIt = ckIt->second.find(listAttr->attribute);
+                                fieldIsAny = fIt != ckIt->second.end() &&
+                                             fIt->second == Type::Kind::Any;
+                            }
+                            if (!fieldIsAny) {
+                                impl_->classFieldListElemKinds[ownerClass][listAttr->attribute] = Type::Kind::Instance;
+                                impl_->classFieldListElemClassName[ownerClass][listAttr->attribute] = appendedClassName;
+                            }
                         }
                     }
                 } else if (auto* listName = dynamic_cast<NameExpr*>(attr.object.get())) {
-                    impl_->varListElemKinds[listName->name] = Type::Kind::Instance;
-                    impl_->varListElemClassName[listName->name] = appendedClassName;
+                    auto ekIt = impl_->varListElemKinds.find(listName->name);
+                    bool varIsAny = ekIt != impl_->varListElemKinds.end() &&
+                                    ekIt->second == Type::Kind::Any;
+                    if (!varIsAny) {
+                        impl_->varListElemKinds[listName->name] = Type::Kind::Instance;
+                        impl_->varListElemClassName[listName->name] = appendedClassName;
+                    }
                 }
             }
             node.args[0]->accept(*this);
@@ -1224,6 +1258,12 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
             // D030 Phase 3.C note: dragon_list_insert is still polymorphic
             // (i64-funneled) - typed insert ops can be added in a follow-up if
             // insert becomes a hot path. For now we coerce to i64 as before.
+            // dragon_list_insert BORROWS its value (increfs internally, unlike
+            // append's adopt), so an owned temp arg (`xs.insert(0, "a" + s)`)
+            // keeps its construction +1 forever without the same drain its
+            // sibling handlers (remove/extend/index/count) route through.
+            // AUDIT-2026-07-09 1.4; leak-freedom pinned under the ASan build.
+            val = impl_->trackBorrowTemp(node.args[1].get(), val, argTemps);
             if (val->getType() == impl_->f64Type) val = impl_->builder->CreateBitCast(val, impl_->i64Type);
             else if (val->getType() == impl_->i1Type) val = impl_->builder->CreateZExt(val, impl_->i64Type);
             else if (val->getType()->isPointerTy()) val = impl_->builder->CreatePtrToInt(val, impl_->i64Type);
@@ -1357,6 +1397,10 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
         }();
         if (listHandled) {
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
+            if (ownedListRecv && kListRecvDrainOk.count(method))
+                impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_decref"], {obj});
             return true;
         }
     }
@@ -1407,6 +1451,16 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
             return Type::Kind::Unknown;
         };
 
+        // Owned dict RECEIVER temp drain (mirror of ownedListRecv above).
+        // Conservative allow-list: get/setdefault/keys/values/items are
+        // excluded until their result-ownership contracts are pinned (a
+        // borrowed str value or a mixed-tag values() borrow-list must not
+        // outlive a drained receiver).
+        bool ownedDictRecv = impl_->options.gcMode == GCMode::RC &&
+                             !Impl::isBorrowedHeapExpr(attr.object.get()) &&
+                             impl_->isOwnedPtrResult(obj);
+        static const std::set<std::string> kDictRecvDrainOk = {
+            "pop", "popitem", "clear", "update"};
         // Owned heap temporaries for a borrow-method KEY / other-dict arg
         // (d.get(a+b), d.pop(x+y), d.update(make())). Lookups borrow the key, so
         // an owned temp is released at the tail below. setdefault and the
@@ -1647,6 +1701,10 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
         }();
         if (dictHandled) {
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
+            if (ownedDictRecv && kDictRecvDrainOk.count(method))
+                impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_decref"], {obj});
             return true;
         }
     }
@@ -1655,6 +1713,16 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
     if (isSet) {
         attr.object->accept(*this);
         llvm::Value* obj = impl_->lastValue;
+        // Owned set RECEIVER temp drain (mirror of ownedListRecv above). Set
+        // binary ops return fresh sets whose elements are increfed on add, so
+        // none can borrow from the receiver.
+        bool ownedSetRecv = impl_->options.gcMode == GCMode::RC &&
+                            !Impl::isBorrowedHeapExpr(attr.object.get()) &&
+                            impl_->isOwnedPtrResult(obj);
+        static const std::set<std::string> kSetRecvDrainOk = {
+            "add", "remove", "discard", "clear", "union", "intersection",
+            "difference", "symmetric_difference", "issubset", "issuperset",
+            "isdisjoint"};
         // Owned heap temporaries for borrow-method args - the lookup value of
         // remove/discard (via argToI64) and the other-set arg of the binary ops
         // (via setArg). set.add is excluded: it runs its own owned-str decref
@@ -1827,6 +1895,10 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
         }();
         if (setHandled) {
             for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+            impl_->emitMoveOutSlots(node);
+            if (ownedSetRecv && kSetRecvDrainOk.count(method))
+                impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_decref"], {obj});
             return true;
         }
     }
@@ -1951,6 +2023,7 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                             impl_->builder->CreateCall(methodFunc, args, "smcall"));
                     }
                     for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                    impl_->emitMoveOutSlots(node);
                     return true;
                 }
             }
@@ -1996,6 +2069,7 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                             impl_->builder->CreateCall(methodFunc, args, "smcall"));
                     }
                     for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                    impl_->emitMoveOutSlots(node);
                     return true;
                 }
             }
@@ -2066,12 +2140,50 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     node.args[i]->accept(*this);
                     llvm::Value* arg = impl_->lastValue;
                     unsigned paramIdx = (unsigned)(i + paramOffset);
-                    if (mpkIt != impl_->funcParamKinds.end() &&
+                    // An own param ADOPTS the arg's +1 (moved binding or
+                    // fresh temp): the callee releases it; a caller drain
+                    // here would double-free (A/B-proven fresh-temp probe).
+                    bool argDrained = impl_->paramIsOwn(methodFuncName, paramIdx);
+                    if (!argDrained &&
+                        mpkIt != impl_->funcParamKinds.end() &&
                         paramIdx < mpkIt->second.size()) {
                         Impl::VarKind dk = impl_->argTempDecrefKind(
                             node.args[i].get(), mpkIt->second[paramIdx], arg);
-                        if (dk != Impl::VarKind::Other)
+                        if (dk != Impl::VarKind::Other) {
                             argTemps.emplace_back(arg, dk);
+                            argDrained = true;
+                        }
+                    }
+                    if (!argDrained) {
+                        // A MONOMORPHIZED GENERIC method (e.g. assertEqual[T])
+                        // records its T param as a non-heap kind (T is erased ->
+                        // Other), so argTempDecrefKind bails at !isHeapKind and an
+                        // OWNED box result passed to it leaked one object per call
+                        // (`self.assertEqual(m[k], v)`). Drain ONLY a provably-
+                        // OWNED BOX: isOwnedBoxResult has an explicit borrowed-
+                        // returner denylist (dict_get_box / dict_int_get_box /
+                        // list_box_get => false), so a borrowed dict[str,Any]/
+                        // list[Any] element is never double-freed.
+                        if (arg->getType() == impl_->boxType) {
+                            if (impl_->isOwnedBoxResult(arg))
+                                argTemps.emplace_back(arg, Impl::VarKind::Union);
+                        } else {
+                            // NATIVE owned temps (`assertEqual(a + b + [5], ...)`,
+                            // `assertEqual(mklist(), ...)`) leaked one object per
+                            // call through the same erased-T gap. ownedTempDrainKind
+                            // gates on the EXPRESSION first (borrowed Name/Attribute/
+                            // element reads return Other), then the static type,
+                            // then value provenance - so the borrowed int-keyed
+                            // dict[int,str] `d[k]` getter that double-freed a bare
+                            // isOwnedStrResult cut (A/B-proven UAF in
+                            // test_augassign_targets + test_builtin_quickwins) is
+                            // rejected at the expression gate before isOwnedStrResult
+                            // is ever consulted.
+                            Impl::VarKind dk = impl_->ownedTempDrainKind(
+                                node.args[i].get(), arg);
+                            if (dk != Impl::VarKind::Other)
+                                argTemps.emplace_back(arg, dk);
+                        }
                     }
                     if (paramIdx < methodFuncType->getNumParams())
                         arg = impl_->coerceArgFromExpr(node.args[i].get(), arg, methodFuncType->getParamType(paramIdx));
@@ -2129,8 +2241,13 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     }
                 }
                 }  // end non-spread arg build (else branch of callHasSpread)
-                // Fill missing args with default values
-                impl_->fillDefaultArgs(methodFuncName, methodFunc, args, *this);
+                // Fill missing args with default values. Route the sink so a
+                // synthesized heap default (`= [10, 20]`) is drained after the
+                // call like every other owned arg temp - the free-function path
+                // (CallExpr) has always passed it; methods leaked one default
+                // per omitting call (AUDIT-2026-07-09 1.9).
+                impl_->fillDefaultArgs(methodFuncName, methodFunc, args, *this,
+                                       &argTemps);
 
                 // D026 virtual dispatch. Devirtualize to a direct call (C-speed)
                 // unless a subclass overrides this method - then the receiver,
@@ -2164,6 +2281,9 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     }
                 }
 
+                // Exception-safe temps: unwind frees on raise, pop+decref on
+                // normal return (mirrors the free-function call path).
+                auto argTempBases = impl_->pushArgTempCleanups(argTemps);
                 if (methodFuncType->getReturnType()->isVoidTy()) {
                     impl_->builder->CreateCall(methodFuncType, callee, args);
                     impl_->lastValue = llvm::ConstantPointerNull::get(
@@ -2172,7 +2292,9 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     impl_->lastValue = impl_->normalizeIntC(
                         impl_->builder->CreateCall(methodFuncType, callee, args, "mcall"));
                 }
+                impl_->popArgTempCleanups(argTempBases);
                 for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                impl_->emitMoveOutSlots(node);
                 return true;
             }
 
@@ -2474,12 +2596,36 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     node.args[i]->accept(*this);
                     llvm::Value* arg = impl_->lastValue;
                     unsigned paramIdx = (unsigned)(i + paramOffset);
-                    if (mpkIt != impl_->funcParamKinds.end() &&
+                    // An own param ADOPTS the arg's +1 (moved binding or
+                    // fresh temp): the callee releases it; a caller drain
+                    // here would double-free (A/B-proven fresh-temp probe).
+                    bool argDrained = impl_->paramIsOwn(methodFuncName, paramIdx);
+                    if (!argDrained &&
+                        mpkIt != impl_->funcParamKinds.end() &&
                         paramIdx < mpkIt->second.size()) {
                         Impl::VarKind dk = impl_->argTempDecrefKind(
                             node.args[i].get(), mpkIt->second[paramIdx], arg);
-                        if (dk != Impl::VarKind::Other)
+                        if (dk != Impl::VarKind::Other) {
                             argTemps.emplace_back(arg, dk);
+                            argDrained = true;
+                        }
+                    }
+                    if (!argDrained) {
+                        // Monomorphized generic method (T erased -> non-heap kind):
+                        // drain a provably-owned BOX (isOwnedBoxResult has a
+                        // borrowed-returner denylist), or a NATIVE owned temp via
+                        // ownedTempDrainKind (expression-gated first, so borrowed
+                        // getters never reach the isOwnedStrResult false-positive -
+                        // see the NameExpr-receiver path above).
+                        if (arg->getType() == impl_->boxType) {
+                            if (impl_->isOwnedBoxResult(arg))
+                                argTemps.emplace_back(arg, Impl::VarKind::Union);
+                        } else {
+                            Impl::VarKind dk = impl_->ownedTempDrainKind(
+                                node.args[i].get(), arg);
+                            if (dk != Impl::VarKind::Other)
+                                argTemps.emplace_back(arg, dk);
+                        }
                     }
                     if (paramIdx < methodFuncType->getNumParams())
                         arg = impl_->coerceArgFromExpr(node.args[i].get(), arg, methodFuncType->getParamType(paramIdx));
@@ -2539,7 +2685,10 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                 // field/temporary receiver (`self.ctx.wrap_socket(s, False, h)`
                 // omitting do_handshake_on_connect=True) passed too few args and
                 // LLVM rejected the call.
-                impl_->fillDefaultArgs(methodFuncName, methodFunc, args, *this);
+                // Sink wired for the same reason as the NameExpr-receiver path
+                // above: method heap defaults must drain (AUDIT-2026-07-09 1.9).
+                impl_->fillDefaultArgs(methodFuncName, methodFunc, args, *this,
+                                       &argTemps);
 
                 // D026 virtual dispatch on a non-Name receiver (temporaries,
                 // `make(...).speak()`, `arr[0].speak()`): same devirtualize-
@@ -2567,6 +2716,8 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     }
                 }
 
+                // Exception-safe temps (see the NameExpr-receiver path above).
+                auto argTempBases = impl_->pushArgTempCleanups(argTemps);
                 if (methodFuncType->getReturnType()->isVoidTy()) {
                     impl_->builder->CreateCall(methodFuncType, callee, args);
                     impl_->lastValue = llvm::ConstantPointerNull::get(
@@ -2575,7 +2726,9 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                     impl_->lastValue = impl_->normalizeIntC(
                         impl_->builder->CreateCall(methodFuncType, callee, args, "mcall"));
                 }
+                impl_->popArgTempCleanups(argTempBases);
                 for (auto& [v, k] : argTemps) impl_->emitDecrefByKind(v, k);
+                impl_->emitMoveOutSlots(node);
                 return true;
             }
         }

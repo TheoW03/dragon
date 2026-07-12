@@ -115,6 +115,7 @@
 - [The Memory Model](1601-memory-model.md)
 - [How Dragon Compiles](1602-how-dragon-compiles.md)
 - [Performance and the Three Commandments](1603-performance.md)
+- [Ownership: del, own, and dub](1604-ownership.md)
 
 # Building Applications
 
@@ -122,6 +123,7 @@
 - [Building a Concurrent Application](1702-concurrent-application.md)
 - [Command-Line Tools](1703-command-line-tools.md)
 - [A Real Project: The Dragon Docs Site](1704-real-project.md)
+- [Interactive Islands](1705-interactive-islands.md)
 
 # Desktop Applications
 

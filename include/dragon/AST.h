@@ -180,6 +180,18 @@ public:
 class NameExpr : public Expr {
 public:
     std::string name;
+    /// `own x` at a consuming position (call argument, spawn argument, own-
+    /// field-store RHS): the binding's +1 TRANSFERS to the consumer and the
+    /// name is Moved afterwards (docs/002 ADR 2.4/2.8). Set by the parser
+    /// only where the move grammar is legal; a move is always of a BINDING,
+    /// so it lives on the name instead of a wrapper node.
+    bool isMoveMarked = false;
+    /// `dub x`: the ONLY second-owner path - a deep copy priced at this
+    /// exact position (docs/002 ADR 2.7). str/bytes lower to an incref
+    /// (immutable payloads are indistinguishable from copies); containers
+    /// deep-copy; non-dubable types are E11 in the TypeChecker. The source
+    /// binding is READ, never consumed.
+    bool isDubMarked = false;
     void accept(ASTVisitor& visitor) override;
 };
 
@@ -437,6 +449,13 @@ public:
     std::unique_ptr<Expr> value;  // optional
     bool isConst = false;   // true if declared with 'const' (.dr mode)
     bool isStatic = false;  // true if declared with 'static' (.dr mode)
+    /// `own f: T` field marker (docs/001-memory.md): the field is the value's
+    /// SOLE owner - death of the instance releases it (raw handles via the
+    /// intrinsic releaser registry, heap values via the normal dealloc
+    /// decref), and stores must transfer ownership (a borrow is a compile
+    /// error). Set by the parser (.dr class bodies), enforced by
+    /// OwnershipCheck, consumed by the dealloc emission in codegen.
+    bool isOwn = false;
     void accept(ASTVisitor& visitor) override;
 };
 
@@ -597,6 +616,12 @@ public:
 class DeleteStmt : public Stmt {
 public:
     std::vector<std::unique_ptr<Expr>> targets;
+    /// Parallel to `targets`, set by OwnershipCheck (docs/002 ADR): 1 when the
+    /// target is a compiler-PROVEN sole-owner local (`Owned`, no escape fact).
+    /// Codegen emits the debug rc==1 assert only for proven targets; an
+    /// unproven `del` keeps the plain scope-exit-identical release. Empty when
+    /// the pass has not run (e.g. partial-analysis tools).
+    std::vector<uint8_t> provenUnique;
     void accept(ASTVisitor& visitor) override;
 };
 
@@ -631,6 +656,10 @@ struct Parameter {
     std::unique_ptr<Expr> defaultValue;  // optional
     bool isVarArg = false;   // *args
     bool isKwArg = false;    // **kwargs
+    /// `def f(own p: T)`: the callee OWNS p (docs/002 ADR 2.8) - the caller
+    /// moved its +1 in, the body may consume it, and the callee's scope exit
+    /// releases it if nothing did. Both ends of a move must say own (E13/E14).
+    bool isOwn = false;
 };
 
 /// Generic type parameter (PEP 695): the `T` in `class Foo[T]` / `def f[T]()`.

@@ -519,15 +519,19 @@ int64_t dragon_argv_count(void) {
     return (int64_t)g_dragon_argc;
 }
 
-// Returns the i-th argv element as an immortal interned DragonString. Returns
-// "" for out-of-range. Interning makes subsequent equality / hashing work
-// uniformly with string literals from the source file.
+// Returns the i-th argv element as a fresh owned DragonString (+1). Returns
+// "" for out-of-range. This used to dragon_str_intern each result, minting an
+// IMMORTAL string per call with no dedup table: reading sys.argv in a loop
+// grew RSS without bound and the codegen's owned-str drain (argv_at is not a
+// borrowed-returner) was a no-op on it (AUDIT-2026-07-09 2.1). A normal
+// mortal +1 is reclaimed by that existing drain; equality/hashing compare by
+// content, so nothing relied on the interned identity.
 const char* dragon_argv_at(int64_t i) {
     if (i < 0 || i >= (int64_t)g_dragon_argc || !g_dragon_argv) {
-        return dragon_str_intern("", 0);
+        return dragon_string_alloc("", 0);
     }
     const char* s = g_dragon_argv[i];
-    return dragon_str_intern(s, (int64_t)strlen(s));
+    return dragon_string_alloc(s, (int64_t)strlen(s));
 }
 
 void dragon_file_close(void* handle) {

@@ -3,6 +3,7 @@
 #include "dragon/Parser.h"
 #include "dragon/Sema.h"
 #include "dragon/DefiniteAssignment.h"
+#include "dragon/OwnershipCheck.h"
 #include "dragon/TypeChecker.h"
 #include "dragon/CodeGen.h"
 #include "dragon/TypeHintEnforcer.h"
@@ -307,8 +308,23 @@ int typeCheckModuleGraph(Module& entryModule,
         }
 
         // Sema + TypeCheck each dependency module
+        // Surface Sema errors in dependency modules just like the entry module
+        // (below) and like the dependency TypeChecker (further down). Dropping
+        // the return meant a name-resolution error in an imported module was
+        // swallowed - it vanished or resurfaced later as an opaque type error,
+        // violating the "a silent fallback is a silent lie" rule
+        // (AUDIT-2026-07-09 Tier 5.1).
         Sema modSema;
-        modSema.analyze(*mod.ast);
+        if (!modSema.analyze(*mod.ast)) {
+            for (const auto& diag : modSema.diagnostics()) {
+                if (diag.level == SemaDiagnostic::Level::Error) {
+                    std::cerr << formatter.format(mod.filepath,
+                        diag.location.line, diag.location.column,
+                        "error", diag.message);
+                }
+            }
+            return 1;
+        }
 
         // Definite-assignment: reject reads of a no-initializer local before it
         // is assigned on every path (runs after name resolution, type-agnostic).
@@ -354,6 +370,20 @@ int typeCheckModuleGraph(Module& entryModule,
             return 1;
         }
 
+        // Ownership analysis (del/own/dub, docs/002 ADR): needs the
+        // TypeChecker's expression types, so it runs after check().
+        {
+            OwnershipCheck modOwn;
+            if (!modOwn.analyze(*mod.ast)) {
+                for (const auto& diag : modOwn.diagnostics()) {
+                    std::cerr << formatter.format(mod.filepath,
+                        diag.location.line, diag.location.column,
+                        "error", diag.message);
+                }
+                return 1;
+            }
+        }
+
         // Collect this module's exports for downstream modules
         allExports[mod.name] = modTypeChecker.getExports();
 
@@ -397,6 +427,20 @@ int typeCheckModuleGraph(Module& entryModule,
             }
         }
         return 1;
+    }
+
+    // Ownership analysis on the entry module (del/own/dub, docs/002 ADR):
+    // needs the TypeChecker's expression types, so it runs after check().
+    {
+        OwnershipCheck entryOwn;
+        if (!entryOwn.analyze(entryModule)) {
+            for (const auto& diag : entryOwn.diagnostics()) {
+                std::cerr << formatter.format(entryFile,
+                    diag.location.line, diag.location.column,
+                    "error", diag.message);
+            }
+            return 1;
+        }
     }
     return 0;
 }
@@ -614,7 +658,7 @@ Options:
   -f                Force Python mode (for .py files)
   -I <dir>          Add module search path
   --site-packages   Search Python site-packages for modules
-  --backend <c|llvm> Select compilation backend (default: c)
+  --backend <llvm>   Accepted for compatibility and ignored (LLVM is the only backend)
   -v, --verbose     Verbose output
   --dump-ast        Print AST after parsing
   --dump-tokens     Print token stream after lexing

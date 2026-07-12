@@ -180,12 +180,15 @@ void CodeGen::visit(TryStmt& node) {
     } else {
         // No handlers (try with only finally): record the in-flight exception,
         // run finally, then re-raise - do NOT swallow it.
+        // Retain BOTH the saved instance and message (+1 each): if the finally
+        // body raises and catches internally, the slot overwrite releases the
+        // old values - without these holds the deferred re-raise would use
+        // freed pointers. The consume re-raise transfers both holds back.
         auto* curObj = impl_->builder->CreateCall(
-            impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "rr.obj");
-        // Retain the saved message (+1): if the finally body raises and
-        // catches internally, the slot overwrite releases the old message -
-        // without this hold the deferred re-raise would use a freed pointer.
-        // The re-raise transfers the +1 back via the consume variant.
+            impl_->runtimeFuncs["dragon_exc_retain_obj"],
+            {impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "rr.obj.raw")},
+            "rr.obj");
         auto* curMsg = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_exc_bind_msg"], {}, "rr.msg");
         impl_->builder->CreateStore(excType, savedType);
@@ -263,8 +266,14 @@ void CodeGen::visit(TryStmt& node) {
                 // binding - they have no struct shape for `e.x` access.
                 if (impl_->userExcCodes.count(named->name) > 0 &&
                     impl_->classNames.count(named->name)) {
+                    // dragon_exc_bind_obj returns the in-flight instance with
+                    // its OWN +1 (the slot keeps its ref; the next raise's
+                    // overwrite releases it). The binding's scope cleanup
+                    // drops this +1 on the normal path; the unwind cleanup
+                    // entry drops it when a nested raise longjmps past the
+                    // handler (AUDIT-2026-07-09 1.5).
                     auto* obj = impl_->builder->CreateCall(
-                        impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "exc.obj");
+                        impl_->runtimeFuncs["dragon_exc_bind_obj"], {}, "exc.obj");
                     auto* alloca = impl_->createEntryAlloca(
                         func, handler.name, impl_->i8PtrType);
                     impl_->builder->CreateStore(obj, alloca);
@@ -274,6 +283,7 @@ void CodeGen::visit(TryStmt& node) {
                     // `e.code` etc. lower via the right struct GEP.
                     impl_->setVar(handler.name, alloca, Impl::VarKind::ClassInstance);
                     impl_->varClassNames[handler.name] = named->name;
+                    impl_->emitCleanupPush(handler.name, obj, Impl::DCLEAN_OBJ);
                     boundInstance = true;
                 }
             }
@@ -315,9 +325,12 @@ void CodeGen::visit(TryStmt& node) {
         impl_->builder->SetInsertPoint(unmatchedBB);
         auto* reType = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_exc_get_type"], {}, "reraise.type");
+        // Retained (+1) saves - see the no-handler path above.
         auto* reObj = impl_->builder->CreateCall(
-            impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj");
-        // Retained (+1) save - see the no-handler path above.
+            impl_->runtimeFuncs["dragon_exc_retain_obj"],
+            {impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj.raw")},
+            "reraise.obj");
         auto* reMsg = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_exc_bind_msg"], {}, "reraise.msg");
         // Record + route through finally (if any) before re-raising, so a
@@ -387,6 +400,12 @@ void CodeGen::visit(WithStmt& node) {
         std::string className;
         llvm::Value* enterResult = nullptr;  // class CMs only; may == val
         bool isLockTemp = false;  // anonymous `with Lock()` - the with owns + frees it
+        bool subjectOwned = true;  // false for a borrowed subject (bound local /
+                                   // attribute): its slot owns the manager, so
+                                   // with-exit must not decref `val` - doing so
+                                   // over-released and the slot's scope-exit
+                                   // decref read freed memory (A/B-proven UAF,
+                                   // test_d045_privacy / test_rc_with_subject.dr).
     };
     std::vector<CtxInfo> contextHandles;
 
@@ -432,6 +451,10 @@ void CodeGen::visit(WithStmt& node) {
         item.contextExpr->accept(*this);
         llvm::Value* ctxVal = impl_->lastValue;
         llvm::Value* enterResultV = nullptr;  // __enter__ result (class CMs)
+        // Ownership of the manager object follows the subject EXPRESSION:
+        // `with Guard()` mints a ctor temp the with owns (+1 to drop at exit);
+        // `with g` / `with self.guard` borrow the slot's reference.
+        bool subjectOwned = !Impl::isBorrowedHeapExpr(item.contextExpr.get());
 
         bool isClassCtx = !isLockCtx && !ctxClassName.empty() &&
             impl_->hasDunder(ctxClassName, "__enter__") &&
@@ -475,7 +498,7 @@ void CodeGen::visit(WithStmt& node) {
                 }
             }
         }
-        contextHandles.push_back({ctxVal, isClassCtx, isLockCtx, ctxClassName, enterResultV, isLockTemp});
+        contextHandles.push_back({ctxVal, isClassCtx, isLockCtx, ctxClassName, enterResultV, isLockTemp, subjectOwned});
     }
 
     // Class context managers (__exit__) and locks (release) both need an
@@ -515,7 +538,7 @@ void CodeGen::visit(WithStmt& node) {
             ec.isWith = true;
             ec.func = func;
             for (auto& ci : contextHandles)
-                ec.withItems.push_back({ci.isClassCtx, ci.isLock, ci.className, ci.val, ci.enterResult, ci.isLockTemp});
+                ec.withItems.push_back({ci.isClassCtx, ci.isLock, ci.className, ci.val, ci.enterResult, ci.isLockTemp, ci.subjectOwned});
             impl_->exitCleanupStack.push_back(std::move(ec));
         }
         for (auto& stmt : node.body) stmt->accept(*this);
@@ -543,7 +566,8 @@ void CodeGen::visit(WithStmt& node) {
             if (ci.isClassCtx) {
                 impl_->callDunder(ci.className, "__exit__", ci.val);
                 if (impl_->options.gcMode == GCMode::RC) {   // release the CM object (#8)
-                    impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.val});
+                    if (ci.subjectOwned)  // borrowed subject: the slot owns it
+                        impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.val});
                     if (ci.enterResult && ci.enterResult->getType()->isPointerTy())
                         impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.enterResult});
                 }
@@ -561,8 +585,15 @@ void CodeGen::visit(WithStmt& node) {
             // Preserve the typed-field instance too: re-raising through the
             // msg-only entry point would NULL exc_obj and a downstream
             // `except UserExc as e` handler would lose its instance binding.
+            // The obj-raise consumes a +1, and this re-raise borrows the
+            // slot's own pointer - retain first; the same-pointer fold in
+            // dragon_exc_obj_set folds it straight back (net no-op).
             auto* reObj = impl_->builder->CreateCall(
-                impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj");
+                impl_->runtimeFuncs["dragon_exc_retain_obj"],
+                {impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_exc_get_obj"], {},
+                    "reraise.obj.raw")},
+                "reraise.obj");
             auto* reMsg = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_exc_get_msg"], {}, "reraise.msg");
             // msg == slot: dragon_exc_msg_set's self-store no-op keeps the
@@ -581,7 +612,8 @@ void CodeGen::visit(WithStmt& node) {
             if (ci.isClassCtx) {
                 impl_->callDunder(ci.className, "__exit__", ci.val);
                 if (impl_->options.gcMode == GCMode::RC) {
-                    impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.val});
+                    if (ci.subjectOwned)  // borrowed subject: the slot owns it
+                        impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.val});
                     if (ci.enterResult && ci.enterResult->getType()->isPointerTy())
                         impl_->builder->CreateCall(impl_->runtimeFuncs["dragon_decref"], {ci.enterResult});
                 }

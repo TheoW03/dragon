@@ -756,8 +756,14 @@ void CodeGen::visit(RaiseStmt& node) {
     auto emitReraiseCurrent = [&]() {
         auto* t = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_exc_get_type"], {}, "reraise.type");
+        // The obj-raise consumes a +1; this re-raise borrows the slot's own
+        // pointer - retain first, the same-pointer fold nets it out.
         auto* o = impl_->builder->CreateCall(
-            impl_->runtimeFuncs["dragon_exc_get_obj"], {}, "reraise.obj");
+            impl_->runtimeFuncs["dragon_exc_retain_obj"],
+            {impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_exc_get_obj"], {},
+                "reraise.obj.raw")},
+            "reraise.obj");
         auto* m = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_exc_get_msg"], {}, "reraise.msg");
         impl_->builder->CreateCall(
@@ -929,6 +935,13 @@ void CodeGen::visit(RaiseStmt& node) {
                 else if (inst->getType() != impl_->i8PtrType)
                     inst = impl_->builder->CreateBitCast(inst, impl_->i8PtrType);
                 auto* msgVal = impl_->builder->CreateGlobalString(cnIt->second);
+                // The instance is BORROWED from the local's slot; the raise
+                // transfers a +1 into the owning exc_obj slot, so retain
+                // first. The local's own ref is then correctly freed by the
+                // unwind / scope cleanup (AUDIT-2026-07-09 1.5).
+                inst = impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_exc_retain_obj"], {inst},
+                    "raise.obj.retained");
                 impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_raise_exc_obj"],
                     {typeVal, inst, msgVal});
@@ -969,7 +982,8 @@ void CodeGen::visit(NonlocalStmt& node) {
     }
 }
 void CodeGen::visit(DeleteStmt& node) {
-    for (auto& target : node.targets) {
+    for (size_t ti = 0; ti < node.targets.size(); ++ti) {
+        auto& target = node.targets[ti];
         if (auto* nameExpr = dynamic_cast<NameExpr*>(target.get())) {
             auto* alloca = impl_->lookupVar(nameExpr->name);
             if (!alloca) continue;
@@ -979,11 +993,74 @@ void CodeGen::visit(DeleteStmt& node) {
                 if (Impl::isHeapKind(kind)) {
                     auto* val = impl_->builder->CreateLoad(
                         alloca->getAllocatedType(), alloca, nameExpr->name + ".del");
+                    // docs/002 ADR: OwnershipCheck PROVED this binding is the
+                    // value's sole owner, so debug builds (-O0) assert
+                    // rc == 1 right here - the executable form of the proof.
+                    // A disagreement (codegen refcount bug, or a callee that
+                    // retained a borrow) aborts naming this exact line.
+                    // Release builds: the plain decref below, identical to
+                    // scope exit, just earlier.
+                    bool proven = ti < node.provenUnique.size() &&
+                                  node.provenUnique[ti];
+                    if (proven && impl_->options.optimizationLevel == 0) {
+                        auto* file = impl_->builder->CreateGlobalString(
+                            impl_->currentModuleName.empty()
+                                ? "main" : impl_->currentModuleName);
+                        auto* line = llvm::ConstantInt::get(
+                            impl_->i64Type, nameExpr->location().line);
+                        if (kind == Impl::VarKind::Union &&
+                            val->getType() == impl_->boxType) {
+                            impl_->builder->CreateCall(
+                                impl_->runtimeFuncs["dragon_del_assert_unique_box"],
+                                {impl_->boxTag(val, "del.tag"),
+                                 impl_->boxPayloadI64(val, "del.payload"),
+                                 file, line});
+                        } else if (kind == Impl::VarKind::Closure) {
+                            // A Callable slot may hold a bare fn ptr; the box
+                            // variant's closure arm handles the header gate.
+                            auto* asI64 = impl_->builder->CreatePtrToInt(
+                                val, impl_->i64Type, "del.clos.i64");
+                            impl_->builder->CreateCall(
+                                impl_->runtimeFuncs["dragon_del_assert_unique_box"],
+                                {llvm::ConstantInt::get(impl_->i64Type, 10),
+                                 asI64, file, line});
+                        } else if (val->getType()->isPointerTy()) {
+                            auto* cls = llvm::ConstantInt::get(
+                                impl_->i64Type,
+                                kind == Impl::VarKind::Str ? 1 : 0);
+                            impl_->builder->CreateCall(
+                                impl_->runtimeFuncs["dragon_del_assert_unique"],
+                                {impl_->toI8Ptr(val), cls, file, line});
+                        }
+                    }
                     impl_->emitDecrefByKind(val, kind);
+                }
+                // docs/002: del of a PROVEN Lock local destroys the OS
+                // primitive through the same releaser the own-field dealloc
+                // uses. A Lock is a raw pthread mutex (no refcount header),
+                // so the rc==1 assert does not apply; compilation implies
+                // the ownership proof (an escaped/borrowed Lock refuses).
+                else if (nameExpr->type &&
+                         nameExpr->type->kind() == Type::Kind::Lock) {
+                    auto* val = impl_->builder->CreateLoad(
+                        alloca->getAllocatedType(), alloca,
+                        nameExpr->name + ".del.lock");
+                    llvm::Value* p = val;
+                    if (p->getType()->isIntegerTy())
+                        p = impl_->builder->CreateIntToPtr(p, impl_->i8PtrType);
+                    if (p->getType()->isPointerTy())
+                        impl_->builder->CreateCall(
+                            impl_->runtimeFuncs["dragon_lock_destroy"], {p});
                 }
             }
             // Store null/zero to the slot to prevent double-free on scope cleanup
-            if (alloca->getAllocatedType()->isPointerTy()) {
+            if (alloca->getAllocatedType() == impl_->boxType) {
+                // Union slot: the decref above drained the payload by tag;
+                // zero the whole {tag, payload} box so scope cleanup's own
+                // Union drain sees tag 0 and no-ops instead of double-freeing.
+                impl_->builder->CreateStore(
+                    llvm::Constant::getNullValue(impl_->boxType), alloca);
+            } else if (alloca->getAllocatedType()->isPointerTy()) {
                 impl_->builder->CreateStore(
                     llvm::ConstantPointerNull::get(
                         llvm::cast<llvm::PointerType>(alloca->getAllocatedType())),

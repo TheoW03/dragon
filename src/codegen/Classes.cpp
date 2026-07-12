@@ -2,6 +2,8 @@
 #include "../CodeGenImpl.h"
 #include "ClassesShared.h"
 
+#include <functional>
+
 namespace dragon {
 
 
@@ -1359,9 +1361,13 @@ void CodeGen::visit(ClassDecl& node) {
         if (impl_->options.gcMode == GCMode::RC && initDeclForSkip) {
             size_t pStart = initDeclForSkip->hasImplicitSelf ? 0 : 1;
             std::vector<Impl::VarKind> ck;
-            for (size_t pi = pStart; pi < initDeclForSkip->params.size(); ++pi)
+            std::vector<bool> cowns;
+            for (size_t pi = pStart; pi < initDeclForSkip->params.size(); ++pi) {
                 ck.push_back(impl_->typeExprToKind(initDeclForSkip->params[pi].type.get()));
+                cowns.push_back(initDeclForSkip->params[pi].isOwn);
+            }
             impl_->funcParamKinds[newFunc->getName().str()] = std::move(ck);
+            impl_->funcParamOwns[newFunc->getName().str()] = std::move(cowns);
         }
 
         auto* prevFunc = impl_->currentFunction;
@@ -1480,6 +1486,24 @@ void CodeGen::visit(ClassDecl& node) {
             }
             // This class's own defaults last (derived overrides base).
             for (auto& entry : perInstanceDefaults) orderedDefaults.push_back(entry);
+            // Dedupe by field name keeping the LAST (most-derived) entry. The
+            // old last-write-wins stores were not RC-correct: evaluating a
+            // shadowed base default (`items: list = []`) minted a fresh +1
+            // heap value the derived default's plain CreateStore then
+            // overwrote with no release - one leaked base default per
+            // construction (AUDIT-2026-07-09 1.6, test_rc_ctor_defaults.dr).
+            // Skipping the shadowed initializer entirely also means only the
+            // winning default's side effects run, matching override semantics.
+            {
+                std::unordered_set<std::string> seenFromEnd;
+                std::vector<std::pair<std::string, Expr*>> deduped;
+                for (auto it = orderedDefaults.rbegin();
+                     it != orderedDefaults.rend(); ++it)
+                    if (seenFromEnd.insert(it->first).second)
+                        deduped.push_back(*it);
+                std::reverse(deduped.begin(), deduped.end());
+                orderedDefaults = std::move(deduped);
+            }
         }
         if (!orderedDefaults.empty()) {
             impl_->pushScope();  // defaults are class-body exprs: isolate from any ctor params/self
@@ -1603,6 +1627,115 @@ void CodeGen::visit(ClassDecl& node) {
             }
         }
 
+        // docs/001-memory.md own fields: a RAW-HANDLE own field (Lock, TLS
+        // engine ctx, ...) is released when the instance dies, through the
+        // v1 intrinsic alloc->releaser registry (Q1 sign-off: keyed on the
+        // constructor's `self.f = <alloc>()` callee - zero new user surface).
+        // Heap-typed own fields need nothing here: the heap-field loop below
+        // already drops the instance's reference at dealloc. An own raw field
+        // whose releaser cannot be derived is a compile error, per the ADR
+        // release table - never a silent leak.
+        std::vector<std::pair<std::string, std::string>> ownRawReleasers;
+        {
+            std::unordered_set<std::string> ownFieldNames;
+            for (auto& member : node.body)
+                if (auto* ann = dynamic_cast<AnnAssignStmt*>(member.get()))
+                    if (ann->isOwn)
+                        if (auto* nm = dynamic_cast<NameExpr*>(ann->target.get()))
+                            ownFieldNames.insert(nm->name);
+            if (!ownFieldNames.empty()) {
+                static const std::unordered_map<std::string, std::string>
+                    kOwnReleaserRegistry = {
+                        {"Lock", "dragon_lock_destroy"},
+                        {"dragon_lock_new", "dragon_lock_destroy"},
+                        {"dragon_tls_ctx_new", "dragon_tls_ctx_free"},
+                        // A raw malloc'd blob owned by a field pairs with
+                        // libc free (Router._conn_cell's atomic counter).
+                        {"malloc", "free"},
+                    };
+                // Derive each own field's alloc callee from the ctor stores
+                // (E8 guarantees stores are fresh expressions, so a direct
+                // `self.f = <call>()` is the only shape that assigns them).
+                std::unordered_map<std::string, std::string> fieldAllocCallee;
+                std::function<void(const std::vector<std::unique_ptr<Stmt>>&)>
+                    scanBody = [&](const std::vector<std::unique_ptr<Stmt>>& body) {
+                        for (auto& st : body) {
+                            Expr* target = nullptr;
+                            Expr* value = nullptr;
+                            if (auto* as = dynamic_cast<AssignStmt*>(st.get())) {
+                                if (as->targets.size() == 1)
+                                    target = as->targets[0].get();
+                                value = as->value.get();
+                            } else if (auto* an =
+                                           dynamic_cast<AnnAssignStmt*>(st.get())) {
+                                target = an->target.get();
+                                value = an->value.get();
+                            } else if (auto* iff = dynamic_cast<IfStmt*>(st.get())) {
+                                scanBody(iff->thenBody);
+                                for (auto& el : iff->elifClauses) scanBody(el.second);
+                                scanBody(iff->elseBody);
+                                continue;
+                            }
+                            if (!target || !value) continue;
+                            auto* at = dynamic_cast<AttributeExpr*>(target);
+                            if (!at) continue;
+                            auto* obj = dynamic_cast<NameExpr*>(at->object.get());
+                            if (!obj || obj->name != "self") continue;
+                            if (!ownFieldNames.count(at->attribute)) continue;
+                            if (auto* call = dynamic_cast<CallExpr*>(value))
+                                if (auto* callee =
+                                        dynamic_cast<NameExpr*>(call->callee.get()))
+                                    fieldAllocCallee[at->attribute] = callee->name;
+                        }
+                    };
+                for (auto& member : node.body)
+                    if (auto* fn = dynamic_cast<FunctionDecl*>(member.get()))
+                        if (fn->name == "__init__") scanBody(fn->body);
+                // A handle that arrives through an `own` PARAM was allocated
+                // elsewhere, so the ctor-store scan cannot name its releaser.
+                // The same Q1 intrinsic registry, keyed by class.field, covers
+                // those stdlib cases (zero new user surface).
+                static const std::unordered_map<std::string, std::string>
+                    kOwnFieldReleaserRegistry = {
+                        {"SSLSocket._conn", "dragon_tls_conn_free"},
+                    };
+                for (const auto& fname : ownFieldNames) {
+                    // Heap-kind own fields are covered by the field loop below.
+                    bool isHeapField = false;
+                    for (auto& f : fields)
+                        if (f.name == fname && Impl::isHeapKind(f.kind)) {
+                            isHeapField = true;
+                            break;
+                        }
+                    if (isHeapField) continue;
+                    auto acIt = fieldAllocCallee.find(fname);
+                    std::string releaser;
+                    if (acIt != fieldAllocCallee.end()) {
+                        auto rIt = kOwnReleaserRegistry.find(acIt->second);
+                        if (rIt != kOwnReleaserRegistry.end())
+                            releaser = rIt->second;
+                    }
+                    if (releaser.empty()) {
+                        auto frIt = kOwnFieldReleaserRegistry.find(
+                            node.name + "." + fname);
+                        if (frIt != kOwnFieldReleaserRegistry.end())
+                            releaser = frIt->second;
+                    }
+                    if (releaser.empty()) {
+                        impl_->addError(
+                            "own field '" + fname + "' of class '" + node.name +
+                                "' has no registered releaser: the constructor "
+                                "must assign it from a registered allocator "
+                                "(Lock(), dragon_tls_ctx_new, ...) so the "
+                                "compiler can generate the release",
+                            node.location());
+                        continue;
+                    }
+                    ownRawReleasers.emplace_back(fname, releaser);
+                }
+            }
+        }
+
         // Generate __dragon_dealloc_<mod>__<ClassName>(void* self) for classes
         // with heap fields. Mangling matches the rest of the per-class symbols
         // so two same-named classes from different modules get distinct
@@ -1613,7 +1746,7 @@ void CodeGen::visit(ClassDecl& node) {
         auto* deallocFn = llvm::Function::Create(
             deallocFnType, llvm::Function::InternalLinkage, deallocName, impl_->module.get());
 
-        if (hasHeapFields) {
+        if (hasHeapFields || !ownRawReleasers.empty()) {
             auto* prevFunc = impl_->currentFunction;
             auto* prevBlock = impl_->builder->GetInsertBlock();
             impl_->currentFunction = deallocFn;
@@ -1622,6 +1755,43 @@ void CodeGen::visit(ClassDecl& node) {
 
             auto* self = &*deallocFn->arg_begin();
             self->setName("self");
+
+            // own raw-handle fields release FIRST (depth-first chain of
+            // custody: the handle dies with its sole owner; docs/002 3.2).
+            // Null-gated: an owner whose close() already freed and nulled
+            // the handle releases exactly once.
+            for (auto& [fname, releaser] : ownRawReleasers) {
+                auto idxIt = impl_->classFieldIndices[node.name].find(fname);
+                auto tyIt = impl_->classFieldTypes[node.name].find(fname);
+                if (idxIt == impl_->classFieldIndices[node.name].end() ||
+                    tyIt == impl_->classFieldTypes[node.name].end())
+                    continue;
+                auto* gep = impl_->builder->CreateStructGEP(
+                    structType, self, idxIt->second, fname + "_own_ptr");
+                auto* val = impl_->builder->CreateLoad(
+                    tyIt->second, gep, fname + "_own");
+                llvm::Value* p = val;
+                if (p->getType()->isIntegerTy())
+                    p = impl_->builder->CreateIntToPtr(p, impl_->i8PtrType);
+                else if (p->getType() != impl_->i8PtrType)
+                    p = impl_->builder->CreateBitCast(p, impl_->i8PtrType);
+                auto* relFn = impl_->getOrDeclareRuntime(releaser,
+                    llvm::FunctionType::get(impl_->voidType, {impl_->i8PtrType},
+                                            false));
+                auto* nonNull = impl_->builder->CreateICmpNE(
+                    p, llvm::ConstantPointerNull::get(
+                           llvm::cast<llvm::PointerType>(p->getType())),
+                    fname + "_own_set");
+                auto* relBB = llvm::BasicBlock::Create(
+                    *impl_->context, fname + ".own.rel", deallocFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    *impl_->context, fname + ".own.cont", deallocFn);
+                impl_->builder->CreateCondBr(nonNull, relBB, contBB);
+                impl_->builder->SetInsertPoint(relBB);
+                impl_->builder->CreateCall(relFn, {p});
+                impl_->builder->CreateBr(contBB);
+                impl_->builder->SetInsertPoint(contBB);
+            }
 
             // For each heap-typed field, GEP and decref. Track which field
             // names we drop here so the Callable-specific pass below does NOT

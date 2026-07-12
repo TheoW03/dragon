@@ -171,7 +171,7 @@ from threading import Lock, Thread
 
 class Counter {
     value: int = 0
-    lock: Lock = Lock()
+    own lock: Lock = Lock()    # own: the Counter owns (and destroys) its Lock
 
     def bump() -> None {
         with self.lock {

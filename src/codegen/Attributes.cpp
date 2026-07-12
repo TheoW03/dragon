@@ -476,6 +476,10 @@ void CodeGen::visit(AttributeExpr& node) {
 
             // Determine checked tag for the typed-dispatch path.
             int64_t checkTag = impl_->pendingDictCheckTag;
+            // Capture + clear the list-representation companion (see
+            // pendingListViewElemTag); consumed by the tag-5 ptr branch below.
+            int64_t pendingListElem = impl_->pendingListViewElemTag;
+            impl_->pendingListViewElemTag = Impl::kNoListElemCheck;
             if (checkTag < 0 && !dictObjName.empty()) {
                 auto tdIt = impl_->varTypedDictClass.find(dictObjName);
                 if (tdIt != impl_->varTypedDictClass.end()) {
@@ -488,12 +492,13 @@ void CodeGen::visit(AttributeExpr& node) {
                 }
             }
             // D030 Phase 3.F: derive checkTag from the dict's tracked V kind.
+            // typeKindToTag is the dict-VALUE tag domain (Instance -> 7,
+            // matching the store side); typeKindToElemTag's Instance -> 5 is
+            // the list elem_tag domain and made instance reads mismatch.
             if (checkTag < 0 && !dictObjName.empty()) {
                 auto vit = impl_->varDictValueKinds.find(dictObjName);
-                if (vit != impl_->varDictValueKinds.end()) {
-                    checkTag = Impl::typeKindToElemTag(vit->second);
-                    if (checkTag == 0 && vit->second != Type::Kind::Int) checkTag = -1;
-                }
+                if (vit != impl_->varDictValueKinds.end())
+                    checkTag = Impl::typeKindToTag(vit->second);
             }
             // Class-field dict: classFieldDictValueKinds tracks the V type.
             if (checkTag < 0 && !dictFieldClass.empty()) {
@@ -501,8 +506,8 @@ void CodeGen::visit(AttributeExpr& node) {
                 if (cit != impl_->classFieldDictValueKinds.end()) {
                     auto fit = cit->second.find(dictFieldName);
                     if (fit != cit->second.end()) {
-                        int64_t t = Impl::typeKindToElemTag(fit->second);
-                        if (t != 0 || fit->second == Type::Kind::Int) checkTag = t;
+                        int64_t t = Impl::typeKindToTag(fit->second);
+                        if (t >= 0) checkTag = t;
                     }
                 }
             }
@@ -515,10 +520,10 @@ void CodeGen::visit(AttributeExpr& node) {
                         checkTag = Impl::typeKindToTag(fIt->second);
                 }
             }
-            // Static dict[str,V] receiver: derive tag from the value kind.
+            // Static dict[str,V] receiver: derive tag from the value kind
+            // (typeKindToTag - the dict-value tag domain, Instance -> 7).
             if (checkTag < 0 && haveStaticDictValue) {
-                checkTag = Impl::typeKindToElemTag(staticDictValueKind);
-                if (checkTag == 0 && staticDictValueKind != Type::Kind::Int) checkTag = -1;
+                checkTag = Impl::typeKindToTag(staticDictValueKind);
             }
 
             // D030 Phase 3.F: dispatch by checkTag - see SubscriptExpr.
@@ -531,6 +536,11 @@ void CodeGen::visit(AttributeExpr& node) {
                 impl_->lastValue = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_dict_get_str_ptr"], {dict, keyStr, tagVal}, "dictdot.p");
                 impl_->pendingDictCheckTag = -1;
+                if (checkTag == 5 && pendingListElem != Impl::kNoListElemCheck)
+                    impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_list_view_check"],
+                        {impl_->lastValue,
+                         llvm::ConstantInt::get(impl_->i64Type, pendingListElem)});
             } else if (checkTag >= 0) {
                 auto* tagVal = llvm::ConstantInt::get(impl_->i64Type, checkTag);
                 impl_->lastValue = impl_->builder->CreateCall(
@@ -641,6 +651,12 @@ void CodeGen::visit(AttributeExpr& node) {
                         obj = impl_->builder->CreateIntToPtr(obj, impl_->i8PtrType);
                     impl_->lastValue = impl_->normalizeIntC(
                         impl_->builder->CreateCall(getterFn, {obj}, "propget"));
+                    // `f().prop`: the getter's result is its own +1; the
+                    // owned receiver temp is fully consumed - release it.
+                    Impl::VarKind rd =
+                        impl_->ownedTempDrainKind(node.object.get(), obj);
+                    if (rd != Impl::VarKind::Other)
+                        impl_->emitDecrefByKind(obj, rd);
                     return;
                 }
             }
@@ -657,6 +673,53 @@ void CodeGen::visit(AttributeExpr& node) {
                         structIt->second, objPtr, idxIt->second, node.attribute + "_ptr");
                     auto* fieldType = impl_->classFieldTypes[className][node.attribute];
                     impl_->lastValue = impl_->builder->CreateLoad(fieldType, gep, node.attribute);
+                    // `f().attr` (audit 1.7 "receivers"): the receiver temp is
+                    // consumed by this read. isBorrowedHeapExpr classifies an
+                    // attr-on-call OWNED, so the lowering must be TOTAL: the
+                    // field value is RETAINED by kind (an owned +1 the
+                    // consumer adopts - str via the identity-retain CALL so
+                    // value-based classifiers agree), then the receiver is
+                    // released. The retain happens BEFORE the release, so the
+                    // field can never dangle. The one-Cookie-per-call
+                    // `jar.get_cookie(k).value` leak was this site.
+                    Impl::VarKind rd =
+                        impl_->ownedTempDrainKind(node.object.get(), objPtr);
+                    if (rd != Impl::VarKind::Other) {
+                        Impl::VarKind fk = Impl::VarKind::Other;
+                        auto cfk = impl_->classFieldKinds.find(className);
+                        if (cfk != impl_->classFieldKinds.end()) {
+                            auto ff = cfk->second.find(node.attribute);
+                            if (ff != cfk->second.end()) fk = ff->second;
+                        }
+                        llvm::Value* v = impl_->lastValue;
+                        if (fk == Impl::VarKind::Str && v->getType()->isPointerTy()) {
+                            auto* retainFn = impl_->getOrDeclareRuntime(
+                                "dragon_str_retain",
+                                llvm::FunctionType::get(impl_->i8PtrType,
+                                                        {impl_->i8PtrType}, false));
+                            impl_->lastValue = impl_->builder->CreateCall(
+                                retainFn, {impl_->toI8Ptr(v)}, "attr.retain");
+                        } else if (fk == Impl::VarKind::Closure &&
+                                   v->getType()->isPointerTy()) {
+                            impl_->builder->CreateCall(
+                                impl_->runtimeFuncs["dragon_incref_callable"],
+                                {impl_->toI8Ptr(v)});
+                        } else if (fk == Impl::VarKind::Union &&
+                                   v->getType() == impl_->boxType) {
+                            impl_->emitUnionIncref(
+                                impl_->boxPayloadI64(v, "attr.p"),
+                                impl_->boxTag(v, "attr.t"));
+                        } else if (Impl::isHeapKind(fk) &&
+                                   v->getType()->isPointerTy()) {
+                            auto* retainFn = impl_->getOrDeclareRuntime(
+                                "dragon_obj_retain",
+                                llvm::FunctionType::get(impl_->i8PtrType,
+                                                        {impl_->i8PtrType}, false));
+                            impl_->lastValue = impl_->builder->CreateCall(
+                                retainFn, {impl_->toI8Ptr(v)}, "attr.retain");
+                        }
+                        impl_->emitDecrefByKind(objPtr, rd);
+                    }
                     return;
                 }
             }
@@ -720,6 +783,15 @@ void CodeGen::visit(SubscriptExpr& node) {
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_str_slice"], {obj, lower, upper, step}, "strslice");
         }
+        // A slice COPIES: the result is a fresh +1 object independent of the
+        // receiver, so an OWNED receiver temp (`("Z" + p)[1:3]`, `make()[0:2]`)
+        // is fully consumed here and its +1 must be released or it leaks once
+        // per evaluation (audit 1.7). ownedTempDrainKind skips borrowed
+        // receivers (slot / field / element reads).
+        {
+            Impl::VarKind rd = impl_->ownedTempDrainKind(node.object.get(), obj);
+            if (rd != Impl::VarKind::Other) impl_->emitDecrefByKind(obj, rd);
+        }
         return;
     }
 
@@ -777,8 +849,67 @@ void CodeGen::visit(SubscriptExpr& node) {
         node.index->accept(*this);
         llvm::Value* key = impl_->lastValue;
 
+        // An OWNED str KEY temp (`d[p + "x"]`, `d[s.strip()]`) is fully
+        // consumed by the lookup (hash + eq; a READ never retains the key),
+        // so its +1 must be released after the read or it leaks once per
+        // lookup. Captured before the int-key coercions below overwrite
+        // `key`. ownedTempDrainKind skips borrowed exprs, literals, and
+        // scalar keys, so slot/literal keys are never touched.
+        llvm::Value* keyOrig = key;
+        Impl::VarKind keyDrain =
+            impl_->ownedTempDrainKind(node.index.get(), key);
+        auto releaseOwnedKeyTemp = [&]() {
+            if (keyDrain != Impl::VarKind::Other)
+                impl_->emitDecrefByKind(keyOrig, keyDrain);
+        };
+        // An OWNED dict RECEIVER temp (`loads_ints()["k"]`) is fully consumed
+        // by a PROVABLY-SCALAR value read (the value is copied out), so the
+        // whole temp dict must be released after the read or it leaks once
+        // per call (audit 1.7).
+        Impl::VarKind recvDrain =
+            impl_->ownedTempDrainKind(node.object.get(), dict);
+        auto releaseOwnedRecvTempScalar = [&](int64_t tag) {
+            // tag 0/2/3 = int/float/bool: value copied, receiver done.
+            if ((tag == 0 || tag == 2 || tag == 3) &&
+                recvDrain != Impl::VarKind::Other)
+                impl_->emitDecrefByKind(dict, recvDrain);
+        };
+        // A PTR value read from an owned receiver temp (`r.info()["k"]` with
+        // a str/list/dict/bytes value) borrows the element FROM the receiver,
+        // so the receiver could not simply be dropped - that was the bounded
+        // leak deferred in audit 1.7. The total lowering mirrors the
+        // `f().attr` fix: retain the element BY KIND first (str through the
+        // identity-retain CALL so value-based classifiers agree the result
+        // is owned), THEN release the receiver. The element can never dangle
+        // and the temp dict is freed at the read.
+        auto retainElemThenReleaseRecv = [&](int64_t tag) {
+            if (recvDrain == Impl::VarKind::Other) return;
+            llvm::Value* v = impl_->lastValue;
+            if (v && v->getType()->isPointerTy()) {
+                if (tag == 10) {
+                    // Closure: incref-in-place (handles bare fn pointers);
+                    // no returning retain exists for callables.
+                    impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_incref_callable"],
+                        {impl_->toI8Ptr(v)});
+                } else {
+                    auto* retainFn = impl_->getOrDeclareRuntime(
+                        tag == 1 ? "dragon_str_retain" : "dragon_obj_retain",
+                        llvm::FunctionType::get(impl_->i8PtrType,
+                                                {impl_->i8PtrType}, false));
+                    impl_->lastValue = impl_->builder->CreateCall(
+                        retainFn, {impl_->toI8Ptr(v)}, "dictget.retain");
+                }
+            }
+            impl_->emitDecrefByKind(dict, recvDrain);
+        };
+
         // Determine checked tag: pendingDictCheckTag (from AnnAssignStmt) or TypedDict schema
         int64_t checkTag = impl_->pendingDictCheckTag;
+        // Capture + clear the list-representation companion (see
+        // pendingListViewElemTag): consumed below by the tag-5 ptr branches.
+        int64_t pendingListElem = impl_->pendingListViewElemTag;
+        impl_->pendingListViewElemTag = Impl::kNoListElemCheck;
         if (checkTag < 0) {
             // Check if dict variable is a TypedDict with known schema
             if (auto* objName = dynamic_cast<NameExpr*>(node.object.get())) {
@@ -801,16 +932,15 @@ void CodeGen::visit(SubscriptExpr& node) {
         }
         // D030 Phase 3.F: also derive checkTag from the dict's tracked V kind
         // (varDictValueKinds) so plain typed dict reads `d["a"]` go through
-        // the typed runtime op.
+        // the typed runtime op. typeKindToTag is the dict-VALUE tag domain
+        // (Instance -> 7, matching the store side); typeKindToElemTag's
+        // Instance -> 5 is the list elem_tag domain and made instance reads
+        // mismatch ("is list, not bytes").
         if (checkTag < 0) {
             if (auto* objName = dynamic_cast<NameExpr*>(node.object.get())) {
                 auto vit = impl_->varDictValueKinds.find(objName->name);
-                if (vit != impl_->varDictValueKinds.end()) {
-                    checkTag = Impl::typeKindToElemTag(vit->second);
-                    // typeKindToElemTag returns 0 for unknown/Int - only treat
-                    // a non-zero tag as the typed signal.
-                    if (checkTag == 0 && vit->second != Type::Kind::Int) checkTag = -1;
-                }
+                if (vit != impl_->varDictValueKinds.end())
+                    checkTag = Impl::typeKindToTag(vit->second);
             }
         }
         // Fallback: derive checkTag from the typechecker's DictType valueType.
@@ -821,9 +951,8 @@ void CodeGen::visit(SubscriptExpr& node) {
             node.object->type->kind() == Type::Kind::Dict) {
             if (auto* dt = dynamic_cast<DictType*>(node.object->type.get())) {
                 if (dt->valueType) {
-                    int64_t t = Impl::typeKindToElemTag(dt->valueType->kind());
-                    if (t != 0 || dt->valueType->kind() == Type::Kind::Int)
-                        checkTag = t;
+                    int64_t t = Impl::typeKindToTag(dt->valueType->kind());
+                    if (t >= 0) checkTag = t;
                 }
             }
         }
@@ -850,9 +979,8 @@ void CodeGen::visit(SubscriptExpr& node) {
                     if (cit != impl_->classFieldDictValueKinds.end()) {
                         auto fit = cit->second.find(attrExpr->attribute);
                         if (fit != cit->second.end()) {
-                            int64_t t = Impl::typeKindToElemTag(fit->second);
-                            if (t != 0 || fit->second == Type::Kind::Int)
-                                checkTag = t;
+                            int64_t t = Impl::typeKindToTag(fit->second);
+                            if (t >= 0) checkTag = t;
                         }
                     }
                 }
@@ -915,6 +1043,7 @@ void CodeGen::visit(SubscriptExpr& node) {
                 impl_->runtimeFuncs["dragon_dict_get_box"], {dict, key},
                 "dictget.box");
             impl_->pendingDictCheckTag = -1;
+            releaseOwnedKeyTemp();
             return;
         }
 
@@ -928,25 +1057,36 @@ void CodeGen::visit(SubscriptExpr& node) {
             else if (key->getType() != impl_->i64Type)
                 key = impl_->builder->CreateZExtOrTrunc(key, impl_->i64Type);
 
+            int64_t recvReleaseTag = -1;
             if (checkTag == 2) {
                 impl_->lastValue = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_dict_int_get_f64"], {dict, key}, "dictget.if");
                 impl_->pendingDictCheckTag = -1;
+                recvReleaseTag = 2;
             } else if (checkTag == 1 || checkTag == 5 || checkTag == 6 || checkTag == 7 ||
                        checkTag == 10) {  // T39: TAG_CLOSURE - return the closure as a ptr
                 auto* tagVal = llvm::ConstantInt::get(impl_->i64Type, checkTag);
                 impl_->lastValue = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_dict_int_get_ptr"], {dict, key, tagVal}, "dictget.ip");
                 impl_->pendingDictCheckTag = -1;
+                if (checkTag == 5 && pendingListElem != Impl::kNoListElemCheck)
+                    impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_list_view_check"],
+                        {impl_->lastValue,
+                         llvm::ConstantInt::get(impl_->i64Type, pendingListElem)});
+                retainElemThenReleaseRecv(checkTag);
             } else if (checkTag >= 0) {
                 auto* tagVal = llvm::ConstantInt::get(impl_->i64Type, checkTag);
                 impl_->lastValue = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_dict_int_get_checked"], {dict, key, tagVal}, "dictget.ichk");
                 impl_->pendingDictCheckTag = -1;
+                recvReleaseTag = checkTag;
             } else {
                 impl_->lastValue = impl_->builder->CreateCall(
                     impl_->runtimeFuncs["dragon_dict_int_get"], {dict, key}, "dictget.i");
             }
+            releaseOwnedKeyTemp();
+            releaseOwnedRecvTempScalar(recvReleaseTag);
             return;
         }
 
@@ -955,10 +1095,12 @@ void CodeGen::visit(SubscriptExpr& node) {
         //  TAG_FLOAT (2) -> dragon_dict_get_str_f64 -> double
         //  TAG_STR/LIST/DICT/BYTES (1/5/6/7) -> dragon_dict_get_str_ptr -> ptr
         //  TAG_INT/BOOL or unknown -> existing get_checked / get -> i64
+        int64_t recvReleaseTag = -1;
         if (checkTag == 2) {  // TAG_FLOAT
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_dict_get_str_f64"], {dict, key}, "dictget.f");
             impl_->pendingDictCheckTag = -1;
+            recvReleaseTag = 2;
         } else if (checkTag == 1 || checkTag == 5 || checkTag == 6 || checkTag == 7 ||
                    checkTag == 10) {  // T39: TAG_CLOSURE - return the closure as a ptr so
                                       // the borrow-store increfs it (incref_callable)
@@ -966,15 +1108,24 @@ void CodeGen::visit(SubscriptExpr& node) {
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_dict_get_str_ptr"], {dict, key, tagVal}, "dictget.p");
             impl_->pendingDictCheckTag = -1;
+            if (checkTag == 5 && pendingListElem != Impl::kNoListElemCheck)
+                impl_->builder->CreateCall(
+                    impl_->runtimeFuncs["dragon_list_view_check"],
+                    {impl_->lastValue,
+                     llvm::ConstantInt::get(impl_->i64Type, pendingListElem)});
+            retainElemThenReleaseRecv(checkTag);
         } else if (checkTag >= 0) {
             auto* tagVal = llvm::ConstantInt::get(impl_->i64Type, checkTag);
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_dict_get_checked"], {dict, key, tagVal}, "dictget_chk");
             impl_->pendingDictCheckTag = -1;
+            recvReleaseTag = checkTag;
         } else {
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_dict_get"], {dict, key}, "dictget");
         }
+        releaseOwnedKeyTemp();
+        releaseOwnedRecvTempScalar(recvReleaseTag);
         return;
     }
 
@@ -1053,6 +1204,24 @@ void CodeGen::visit(SubscriptExpr& node) {
         impl_->lastValue = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_box_subscript"], {obj, idxBox},
             "box.subscript");
+        // Chained subscript (`obj["b"][2]`): an OWNED box receiver (the inner
+        // dragon_box_subscript returned the element +1) is a temporary this
+        // read fully consumes - release its +1 AFTER the call. The result box
+        // already carries its own incref on the element, so the intermediate
+        // may drop even to zero without invalidating the result. Borrowed
+        // receivers (dict_get_box / dict_int_get_box / list_box_get) are on
+        // isOwnedBoxResult's denylist and are never released here - releasing
+        // a borrowed box is a use-after-free.
+        if (impl_->isOwnedBoxResult(obj))
+            impl_->emitDecrefByKind(obj, Impl::VarKind::Union);
+        // Same for an OWNED box INDEX (`d[keys["i"]]`, `d[k1 + k2]`): the
+        // runtime only reads the index (list position / dict key hash+eq),
+        // never retains it, so the subscript fully consumes the temporary.
+        // A box built here by boxNativeOperand from a native value is an
+        // insertvalue chain, not a box-returning call - isOwnedBoxResult is
+        // false and borrowed indexes stay untouched.
+        if (impl_->isOwnedBoxResult(idxBox))
+            impl_->emitDecrefByKind(idxBox, Impl::VarKind::Union);
         return;
     }
 
@@ -1270,12 +1439,44 @@ void CodeGen::visit(SubscriptExpr& node) {
             // bitcast / IntToPtr needed.
             impl_->lastValue = elemLoad;
         }
+        // An OWNED receiver temp (`make()[0]`) is fully consumed by a SCALAR
+        // element read - the value was copied out, so the temp's +1 must be
+        // released or the whole list leaks once per evaluation (audit 1.7).
+        // Ptr elements are NOT released here: the element is borrowed FROM
+        // the receiver, so dropping the receiver before the consumer takes
+        // its own ref would be a use-after-free (that case needs a retained
+        // read and stays a bounded leak until it lands). The elem must be
+        // PROVABLY scalar from the receiver's declared ListType - the i64
+        // branch also swallows unknown elem kinds (bare `list`), and an
+        // undeclared ptr elem misread as i64 would dangle after the release.
+        bool elemProvablyScalar = false;
+        if (node.object->type) {
+            if (auto* lt = dynamic_cast<ListType*>(node.object->type.get())) {
+                if (lt->elementType) {
+                    auto ek = lt->elementType->kind();
+                    elemProvablyScalar = (ek == Type::Kind::Int ||
+                                          ek == Type::Kind::Float ||
+                                          ek == Type::Kind::Bool);
+                }
+            }
+        }
+        if (!isPtrElem && elemProvablyScalar) {
+            Impl::VarKind rd = impl_->ownedTempDrainKind(node.object.get(), obj);
+            if (rd != Impl::VarKind::Other) impl_->emitDecrefByKind(obj, rd);
+        }
     } else if (isBytes) {
         impl_->lastValue = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_bytes_get"], {obj, idx}, "bytesget");
+        // bytes[i] copies out an int - an owned bytes receiver temp is done.
+        Impl::VarKind rd = impl_->ownedTempDrainKind(node.object.get(), obj);
+        if (rd != Impl::VarKind::Other) impl_->emitDecrefByKind(obj, rd);
     } else {
         impl_->lastValue = impl_->builder->CreateCall(
             impl_->runtimeFuncs["dragon_str_index"], {obj, idx}, "strget");
+        // s[i] mallocs a FRESH 1-char string (see isBorrowedHeapExpr) - the
+        // owned str receiver temp (`("Z" + p)[0]`) is fully consumed here.
+        Impl::VarKind rd = impl_->ownedTempDrainKind(node.object.get(), obj);
+        if (rd != Impl::VarKind::Other) impl_->emitDecrefByKind(obj, rd);
     }
 }
 void CodeGen::visit(SliceExpr&) {

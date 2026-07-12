@@ -12,9 +12,17 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dragon {
+
+// M1/M2 call-validation metadata filler (defined in TypeCheckerStmts.cpp).
+// Shared with the function-signature pre-pass in TypeChecker.cpp so
+// forward-referenced module functions carry full arg metadata too.
+void fillFuncMeta(FunctionType& ft, const std::vector<Parameter>& params,
+                  bool isMethod, bool hasImplicitSelf,
+                  bool isClassMethod = false);
 
 struct TypeChecker::Impl {
     std::vector<TypeDiagnostic> diagnostics;
@@ -41,6 +49,14 @@ struct TypeChecker::Impl {
 
     // Function return type stack (for checking return statements)
     std::vector<std::shared_ptr<Type>> returnTypeStack;
+
+    // Lambda bodies already walked by THIS checker instance. inferType()
+    // re-visits expression nodes freely (no memoization), so a lambda passed
+    // as an argument can be visited several times in one pass; the body walk
+    // in visit(LambdaExpr) is guarded to run once - the same once-per-walk
+    // cadence a def body gets - so diagnostics aren't duplicated and generic
+    // stamping isn't re-entered.
+    std::unordered_set<const LambdaExpr*> checkedLambdaBodies;
 
     // Module types keyed by canonical dotted path. Holds both registered
     // dependency modules and intermediate package nodes. `import x.y`

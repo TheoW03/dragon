@@ -114,6 +114,12 @@ public:
     // paramTypes. `requiredParams` counts params with no default and not *args/
     // **kwargs; `hasVarArg` is set if any param is *args/**kwargs.
     std::vector<std::string> paramNames;
+    // docs/002 2.8: aligned with paramNames - true for `own p: T` params.
+    // A move has two ends and both must say own: a NAMED arg to an own param
+    // without `own` is E13; `own x` to a borrowing param is E14. Fresh temps
+    // (non-name arguments) pass an own param without the keyword - there is
+    // no binding to poison.
+    std::vector<bool> paramOwns;
     size_t requiredParams = 0;
     bool hasVarArg = false;
     // True if the signature has a `**kwargs` param (a superset of hasVarArg,
@@ -349,6 +355,9 @@ public:
     void visit(BooleanLiteral& node) override;
     void visit(NoneLiteral& node) override;
     void visit(NameExpr& node) override;
+    /// E11 (docs/002 2.7): dubability composes - true iff the whole payload
+    /// can honestly be deep-copied; `why` names the first offender otherwise.
+    bool typeIsDubable(const Type* t, std::string& why);
     void visit(BinaryExpr& node) override;
     void visit(ChainedCompExpr& node) override;
     void visit(WalrusExpr& node) override;
@@ -411,6 +420,17 @@ private:
     // literal has no prior alias - covariance at construction can't be
     // exploited. Returns true if it retyped (so the caller skips the error).
     bool tryExpectedTypeLiteral(Expr* value, const std::shared_ptr<Type>& expected);
+    // A container LITERAL flowing into an Any-typed context is born in the BOX
+    // representation (list[Any] / dict[K, Any]), recursively: everything
+    // reachable through Any must use the box element layout, or a later
+    // list[Any] read walks a monomorphized list at the 16B box stride (OOB /
+    // silent wrong values). Fresh literals have no alias, so the retype is
+    // free of aliasing hazards. Class-descriptor literals ([Foo, Bar]) are
+    // exempt - list[type] uses native i64 handles, not boxes.
+    void boxNestedContainerLiteralForAny(Expr* value);
+    // Non-empty hint appended to assignment/argument errors when the mismatch
+    // is exactly the list representation split (list[T] vs list[Any]).
+    static std::string listReprMismatchHint(const Type& from, const Type& to);
     // If `value` is a list/set literal assigned to a container with a concrete
     // (non-Any) element type, emit a precise error for the first element that
     // isn't assignable to it. Catches the silent miscompile where first-element

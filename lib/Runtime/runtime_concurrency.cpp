@@ -60,6 +60,7 @@ typedef struct {
     int64_t result;
     int8_t done;    // accessed via __atomic builtins for cross-thread visibility
     int8_t joined;  // CAS'd 0->1 in join to defeat double-join race (UB + double-free)
+    int8_t started; // 1 iff pthread_create succeeded; join must not touch tid when 0
 } DragonThread;
 
 typedef struct {
@@ -109,6 +110,7 @@ DragonThread* dragon_thread_fire(void* fn, int64_t* args, int64_t nargs) {
     t->result = 0;
     t->done = 0;
     t->joined = 0;
+    t->started = 0;
     DragonFireArgs* fa = (DragonFireArgs*)malloc(sizeof(DragonFireArgs));
     fa->thread = t;
     fa->fn = fn;
@@ -120,7 +122,22 @@ DragonThread* dragon_thread_fire(void* fn, int64_t* args, int64_t nargs) {
     }
     fa->nargs = nargs;
     dragon_gc_go_concurrent();  // a heap-mutating OS thread is starting
-    pthread_create(&t->tid, NULL, dragon_thread_entry, fa);
+    // Check pthread_create: on EAGAIN (thread-limit exhaustion, the exact
+    // long-running-process failure mode) the entry never runs, so t->done is
+    // never set and t->tid is garbage. The scoped-fire join would then
+    // pthread_join a garbage tid (undefined behavior) and block forever on
+    // done, and fa / fa->args / t all leak (AUDIT-2026-07-09 2.6). On failure,
+    // mark the handle done with an error result and free the args so the join
+    // returns immediately instead of hanging on UB.
+    int rc = pthread_create(&t->tid, NULL, dragon_thread_entry, fa);
+    if (rc != 0) {
+        if (fa->args) free(fa->args);
+        free(fa);
+        t->result = 0;
+        __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+    } else {
+        t->started = 1;
+    }
     return t;
 }
 
@@ -140,7 +157,11 @@ int64_t dragon_thread_join(DragonThread* t) {
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         return __atomic_load_n(&t->result, __ATOMIC_ACQUIRE);
     }
-    pthread_join(t->tid, NULL);
+    // Only join a thread that actually started: on a pthread_create failure
+    // t->tid is garbage, and pthread_join on it is undefined (AUDIT 2.6). The
+    // failed handle already has done=1 and result=0.
+    if (t->started)
+        pthread_join(t->tid, NULL);
     int64_t result = t->result;
     free(t);
     return result;

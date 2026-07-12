@@ -78,6 +78,21 @@ bool TypeChecker::tryExpectedTypeLiteral(Expr* value, const std::shared_ptr<Type
     if (!value || !expected) return false;
     // list literal -> list[Base]: accept when every element <: Base.
     if (expected->kind() == Type::Kind::List) {
+        // A SET literal also types as ListType (sets ride the list model).
+        // Accept it WITHOUT retyping (`s: set = {1, 2}`, where bare `set`
+        // resolves to list[Any]): set codegen routes on the literal's own
+        // type, and sets have their own runtime representation (dragon_set_*)
+        // - there is no monomorphized/boxed list split to guard here.
+        if (auto* setLit = dynamic_cast<SetExpr*>(value)) {
+            const auto& base =
+                static_cast<const ListType&>(*expected).elementType;
+            if (!base || setLit->elements.empty()) return false;
+            for (auto& el : setLit->elements) {
+                if (!el->type) return false;
+                if (!el->type->isSubtypeOf(*base)) return false;
+            }
+            return true;
+        }
         auto* lit = dynamic_cast<ListExpr*>(value);
         if (!lit || lit->elements.empty()) return false;
         const auto& base = static_cast<const ListType&>(*expected).elementType;
@@ -85,6 +100,20 @@ bool TypeChecker::tryExpectedTypeLiteral(Expr* value, const std::shared_ptr<Type
         for (auto& el : lit->elements) {
             if (!el->type) return false;
             if (!el->type->isSubtypeOf(*base)) return false;
+        }
+        if (base->kind() == Type::Kind::Any) {
+            // Class-descriptor literals ([Foo, Bar] into list[type], which
+            // resolves to list[Any]): accept WITHOUT retyping - descriptor
+            // lists are native i64 handles, never the box representation.
+            for (auto& el : lit->elements)
+                if (el->type && el->type->kind() == Type::Kind::Class)
+                    return true;
+            // An Any element type must reach INTO nested container literals:
+            // the outer literal becomes a box list, so its elements are only
+            // ever seen through Any - a nested literal left at its narrow type
+            // would be built monomorphized and then walked at the box stride.
+            for (auto& el : lit->elements)
+                boxNestedContainerLiteralForAny(el.get());
         }
         lit->type = expected;  // fresh literal -> sound covariant retype
         return true;
@@ -102,10 +131,59 @@ bool TypeChecker::tryExpectedTypeLiteral(Expr* value, const std::shared_ptr<Type
                 if (!v->type || !v->type->isSubtypeOf(*dt.valueType)) return false;
             }
         }
+        // Same Any propagation for dict VALUES (dicts themselves have one
+        // uniform tagged representation, but a nested list literal in an Any
+        // value slot must still be born boxed).
+        if (dt.valueType && dt.valueType->kind() == Type::Kind::Any)
+            for (auto& [k, v] : lit->entries)
+                if (v) boxNestedContainerLiteralForAny(v.get());
         lit->type = expected;
         return true;
     }
     return false;
+}
+
+// True when a literal's elements are class descriptors ([Foo, Bar]) - those
+// lists use native i64 handles (list[type]), never the box representation.
+static bool literalElementsAreClassDescriptors(ListExpr* lit) {
+    for (auto& el : lit->elements)
+        if (el->type && el->type->kind() == Type::Kind::Class) return true;
+    return false;
+}
+
+void TypeChecker::boxNestedContainerLiteralForAny(Expr* value) {
+    if (!value) return;
+    if (auto* l = dynamic_cast<ListExpr*>(value)) {
+        if (literalElementsAreClassDescriptors(l)) return;
+        for (auto& el : l->elements)
+            boxNestedContainerLiteralForAny(el.get());
+        value->type = std::make_shared<ListType>(impl_->anyType);
+    } else if (auto* d = dynamic_cast<DictExpr*>(value)) {
+        for (auto& [k, v] : d->entries)
+            if (v) boxNestedContainerLiteralForAny(v.get());
+        std::shared_ptr<Type> keyT;
+        if (d->type && d->type->kind() == Type::Kind::Dict)
+            keyT = static_cast<DictType&>(*d->type).keyType;
+        if (!keyT) keyT = impl_->strType;
+        value->type = std::make_shared<DictType>(keyT, impl_->anyType);
+    }
+    // Set literals (SetExpr) keep their type: sets ride the ListType model but
+    // have their own build path; an Any-held set is untested territory - do
+    // not silently retype it here.
+}
+
+std::string TypeChecker::listReprMismatchHint(const Type& from, const Type& to) {
+    auto* fl = dynamic_cast<const ListType*>(&from);
+    auto* tl = dynamic_cast<const ListType*>(&to);
+    if (!fl || !tl || !fl->elementType || !tl->elementType) return "";
+    bool fromBox = fl->elementType->kind() == Type::Kind::Any ||
+                   fl->elementType->kind() == Type::Kind::Union;
+    bool toBox = tl->elementType->kind() == Type::Kind::Any ||
+                 tl->elementType->kind() == Type::Kind::Union;
+    if (fromBox == toBox) return "";
+    return " (the two have different element layouts: monomorphized vs boxed;"
+           " build the value with this element type at its declaration, or copy"
+           " it element-wise)";
 }
 
 void TypeChecker::propagateAnnotationToEmptyLiteral(Expr* value, const std::shared_ptr<Type>& annotType) {
@@ -151,18 +229,23 @@ void TypeChecker::visit(AssignStmt& node) {
         // Force box representation for a literal assigned to list[Any] /
         // dict[K, Any] (see AnnAssignStmt for the rationale); `list[type]`
         // resolves to Any but uses class descriptors, so it is excluded.
-        if (annotationElementIsAny(annotType) &&
-            !containerElementAnnotationIsType(node.typeAnnotation.get()))
+        bool elemIsType = containerElementAnnotationIsType(node.typeAnnotation.get());
+        if (annotationElementIsAny(annotType) && !elemIsType)
             tryExpectedTypeLiteral(node.value.get(), annotType);
         // Per-element literal check first: first-element inference can match the
         // annotation while a later element doesn't (list[int] = [1, 2, "three"]).
+        // `list[type]` (class-descriptor lists) accepts any list value: both
+        // sides are native i64 handles, and list invariance would otherwise
+        // reject it now that list[T] </: list[Any].
         if (!diagnoseHeterogeneousLiteral(node.value.get(), annotType) &&
             annotType->kind() != Type::Kind::Unknown &&
             valueType->kind() != Type::Kind::Unknown &&
+            !(elemIsType && valueType->kind() == Type::Kind::List) &&
             !valueType->isAssignableTo(*annotType) &&
             !tryExpectedTypeLiteral(node.value.get(), annotType)) {
             error(node.location(), "cannot assign '" + valueType->toString() +
-                  "' to variable of type '" + annotType->toString() + "'");
+                  "' to variable of type '" + annotType->toString() + "'" +
+                  listReprMismatchHint(*valueType, *annotType));
         }
         // Define with the annotation type
         for (auto& target : node.targets) {
@@ -257,6 +340,21 @@ void TypeChecker::visit(AssignStmt& node) {
                             impl_->define(n->name, tt.elementTypes[i]);
                     }
                 }
+            } else if (auto* sub = dynamic_cast<SubscriptExpr*>(target.get())) {
+                // `d[k] = ["a", "b"]` into a dict[K, Any] / list[Any] slot: the
+                // literal flows into an Any context, so it must be born in the
+                // box representation (same rule the annotated-decl sites apply
+                // via tryExpectedTypeLiteral).
+                auto contType = inferType(sub->object.get());
+                bool slotIsAny = false;
+                if (auto* dt = dynamic_cast<DictType*>(contType.get()))
+                    slotIsAny = dt->valueType &&
+                                dt->valueType->kind() == Type::Kind::Any;
+                else if (auto* lt = dynamic_cast<ListType*>(contType.get()))
+                    slotIsAny = lt->elementType &&
+                                lt->elementType->kind() == Type::Kind::Any;
+                if (slotIsAny)
+                    boxNestedContainerLiteralForAny(node.value.get());
             }
             inferType(target.get());
         }
@@ -266,8 +364,51 @@ void TypeChecker::visit(AssignStmt& node) {
 void TypeChecker::visit(AugAssignStmt& node) {
     auto targetType = inferType(node.target.get());
     auto valueType = inferType(node.value.get());
-    // Type checking for augmented assignment follows the same rules as binary ops
-    // For now, just visit both sides
+    // `x += y` desugars to `x = x <op> y`, so it must obey the SAME operand
+    // rules as the binary operator - and then the result must be assignable
+    // back to the target. Previously this did nothing ("for now, just visit
+    // both sides"), so `x: int` followed by `x += "s"` compiled while the
+    // equivalent `x = x + "s"` was correctly rejected - a hole in commandment 3
+    // (types must be honest) that a grep for TODO would not even find
+    // (AUDIT-2026-07-09 Tier 5.3). This mirrors the accept/reject decisions in
+    // visit(BinaryExpr) for the compound operators; the two encode the same
+    // operator table and should be unified when that table is centralized
+    // (Tier 6 duplication note).
+    if (!targetType || !valueType) return;
+    auto tk = targetType->kind();
+    auto vk = valueType->kind();
+    // Unknown / Any / class instances (dunder dispatch) / type parameters are
+    // resolved elsewhere or at CodeGen - never rejected here, exactly as
+    // visit(BinaryExpr) passes them through.
+    auto opaque = [](Type::Kind k) {
+        return k == Type::Kind::Unknown || k == Type::Kind::Any ||
+               k == Type::Kind::Instance || k == Type::Kind::TypeVar;
+    };
+    if (opaque(tk) || opaque(vk)) return;
+
+    bool tNum = targetType->isSubtypeOf(*impl_->intType) ||
+                tk == Type::Kind::Float;
+    bool vNum = valueType->isSubtypeOf(*impl_->intType) ||
+                vk == Type::Kind::Float;
+    TokenType op = node.op.type();
+    bool ok = false;
+    if (tNum && vNum) {
+        ok = true;  // int/float arithmetic in any combination
+    } else if (op == TokenType::PLUS_EQUAL) {
+        // Concatenation forms: str += str, bytes += bytes, list += list.
+        ok = (tk == Type::Kind::Str && vk == Type::Kind::Str) ||
+             (tk == Type::Kind::Bytes && vk == Type::Kind::Bytes) ||
+             (tk == Type::Kind::List && vk == Type::Kind::List);
+    } else if (op == TokenType::STAR_EQUAL) {
+        // Repetition: str/bytes/list *= int (target is the sequence).
+        ok = (tk == Type::Kind::Str || tk == Type::Kind::Bytes ||
+              tk == Type::Kind::List) && vNum;
+    }
+    if (!ok) {
+        error(node.location(), "unsupported operand types for " +
+              node.op.lexeme() + ": '" + targetType->toString() + "' and '" +
+              valueType->toString() + "'");
+    }
 }
 
 void TypeChecker::visit(AnnAssignStmt& node) {
@@ -291,19 +432,22 @@ void TypeChecker::visit(AnnAssignStmt& node) {
         // the Any annotation (sound - every element <: Any) forces the box list.
         // `list[type]` also resolves to Any but uses class descriptors, not
         // boxes, so it is excluded.
-        if (annotationElementIsAny(annotType) &&
-            !containerElementAnnotationIsType(node.annotation.get()))
+        bool elemIsType = containerElementAnnotationIsType(node.annotation.get());
+        if (annotationElementIsAny(annotType) && !elemIsType)
             tryExpectedTypeLiteral(node.value.get(), annotType);
         // Per-element literal check first (see AssignStmt): catches a later
         // element that violates the declared element type even when first-
-        // element inference happened to match.
+        // element inference happened to match. `list[type]` accepts any list
+        // value (native i64 descriptor handles on both sides - see AssignStmt).
         if (!diagnoseHeterogeneousLiteral(node.value.get(), annotType) &&
             annotType->kind() != Type::Kind::Unknown &&
             valueType->kind() != Type::Kind::Unknown &&
+            !(elemIsType && valueType->kind() == Type::Kind::List) &&
             !valueType->isAssignableTo(*annotType) &&
             !tryExpectedTypeLiteral(node.value.get(), annotType)) {
             error(node.location(), "cannot assign '" + valueType->toString() +
-                  "' to variable of type '" + annotType->toString() + "'");
+                  "' to variable of type '" + annotType->toString() + "'" +
+                  listReprMismatchHint(*valueType, *annotType));
         }
     }
 
@@ -859,14 +1003,20 @@ void TypeChecker::visit(MatchStmt& node) {
 void TypeChecker::visit(ReturnStmt& node) {
     if (node.value) {
         auto retType = inferType(node.value.get());
-        // Check against expected return type
+        // Check against expected return type. A fresh container literal is
+        // blessed against the declared return type (tryExpectedTypeLiteral) so
+        // `return ["a"]` in a `-> list[Any]` function is BUILT as a box list -
+        // the same covariance-at-construction rule the assign sites apply.
         if (!impl_->returnTypeStack.empty()) {
             auto& expected = impl_->returnTypeStack.back();
             if (expected->kind() != Type::Kind::Unknown &&
                 retType->kind() != Type::Kind::Unknown &&
-                !retType->isAssignableTo(*expected)) {
+                !retType->isAssignableTo(*expected) &&
+                !tryExpectedTypeLiteral(node.value.get(), expected)) {
                 error(node.location(), "return type '" + retType->toString() +
-                      "' does not match declared return type '" + expected->toString() + "'");
+                      "' does not match declared return type '" +
+                      expected->toString() + "'" +
+                      listReprMismatchHint(*retType, *expected));
             }
         }
     } else {
@@ -1007,10 +1157,11 @@ void TypeChecker::visit(FromImportStmt& node) {
 // precede defaulted ones (enforced by sema), so the first `requiredParams`
 // names are the mandatory ones. A *args/**kwargs param sets hasVarArg, which
 // disables the call-site arity check (its bound is open).
-static void fillFuncMeta(FunctionType& ft, const std::vector<Parameter>& params,
-                         bool isMethod, bool hasImplicitSelf,
-                         bool isClassMethod = false) {
+void fillFuncMeta(FunctionType& ft, const std::vector<Parameter>& params,
+                  bool isMethod, bool hasImplicitSelf,
+                  bool isClassMethod) {
     ft.paramNames.clear();
+    ft.paramOwns.clear();
     ft.requiredParams = 0;
     ft.hasVarArg = false;
     ft.hasKwArg = false;
@@ -1029,6 +1180,7 @@ static void fillFuncMeta(FunctionType& ft, const std::vector<Parameter>& params,
             continue;
         }
         ft.paramNames.push_back(p.name);
+        ft.paramOwns.push_back(p.isOwn);
         if (!p.defaultValue) ft.requiredParams++;
     }
 }

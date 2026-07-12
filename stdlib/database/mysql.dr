@@ -104,6 +104,11 @@ def _put_lenenc(v: int) -> bytes {
 
 
 class MySqlConnection(Connection) {
+    # Declared so the field's class is statically KNOWN (see postgres.dr's
+    # twin note): a ctor-inferred instance field loses its kind and dealloc
+    # skipped it - one leaked TcpStream per connection
+    sock: TcpStream
+
     def(dsn: str) {
         # Parse mysql://user:password@host:port/dbname
         rest: str = dsn

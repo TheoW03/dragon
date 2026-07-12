@@ -30,6 +30,9 @@ struct Symbol {
     bool isConst = false;   // Dragon const binding
     bool isStatic = false;  // Dragon static member
     bool isBuiltin = false; // injected builtin (outer namespace) - may be shadowed
+    bool isModuleForwardDecl = false; // hoisted module-level const in the pre-pass;
+                                      // its own second-pass visit is the real
+                                      // declaration, not a redeclaration
 };
 
 /// Represents a scope (function, class, module, etc.)

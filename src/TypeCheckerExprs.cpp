@@ -401,6 +401,25 @@ void TypeChecker::visit(CallExpr& node) {
                   std::to_string(node.args.size()) + " were given");
             err = true;
         }
+        // docs/002 2.8: a move has a declaration end and a call-site end, and
+        // BOTH must say own. E13: a NAMED argument to an own parameter needs
+        // the visible move (fresh temps are exempt - no binding to poison).
+        // E14: own at a borrowing parameter has no meaning.
+        for (size_t i = 0; i < node.args.size() && i < ft.paramOwns.size(); ++i) {
+            auto* nm = dynamic_cast<NameExpr*>(node.args[i].get());
+            bool argMoved = nm && nm->isMoveMarked;
+            if (ft.paramOwns[i] && nm && !argMoved) {
+                error(node.args[i]->location(),
+                      dispName + " takes ownership of its argument; move it "
+                      "with 'own " + nm->name + "', or pass a fresh value");
+                err = true;
+            } else if (!ft.paramOwns[i] && argMoved) {
+                error(node.args[i]->location(),
+                      dispName +
+                          " borrows its argument; own has no meaning here");
+                err = true;
+            }
+        }
         for (size_t i = 0; i < node.args.size() && i < nParams; ++i) filled[i] = true;
         for (auto& kw : node.kwArgs) {
             if (kw.first.empty()) continue;  // ** spread - C9 handles
@@ -485,8 +504,34 @@ void TypeChecker::visit(CallExpr& node) {
                 if (!at || !pt) continue;
                 auto ak = at->kind(), pk = pt->kind();
                 if (ak == Type::Kind::Unknown || ak == Type::Kind::Any ||
-                    pk == Type::Kind::Unknown || pk == Type::Kind::Any)
+                    pk == Type::Kind::Unknown)
                     continue;
+                if (pk == Type::Kind::Any) {
+                    // A container literal ENTERING A BOXED-ELEMENT CONTAINER
+                    // (append/remove on a list[Any] receiver - the Any param is
+                    // the receiver's element type) is born in the box
+                    // representation: it will only ever be read back through
+                    // Any. A literal passed to a PLAIN Any param keeps its
+                    // concrete monomorphized type (commandment #3) - the box
+                    // boundary carries native lists safely (dynamic ops
+                    // header-dispatch; builtins like bytes() read natively;
+                    // unboxing to list[Any] raises a teaching TypeError).
+                    if (auto* att = dynamic_cast<AttributeExpr*>(node.callee.get())) {
+                        bool recvIsBoxList = false;
+                        if (att->object && att->object->type) {
+                            if (auto* rlt = dynamic_cast<ListType*>(
+                                    att->object->type.get()))
+                                recvIsBoxList = rlt->elementType &&
+                                    rlt->elementType->kind() == Type::Kind::Any;
+                        }
+                        if (recvIsBoxList &&
+                            (att->attribute == "append" ||
+                             att->attribute == "insert" ||
+                             att->attribute == "remove"))
+                            boxNestedContainerLiteralForAny(node.args[i].get());
+                    }
+                    continue;
+                }
                 // None is the null pointer - admissible for any ptr-shaped
                 // param (nullable pattern); a Union arg may still need
                 // narrowing the checker can't see. Both are skipped.
@@ -495,11 +540,57 @@ void TypeChecker::visit(CallExpr& node) {
                     continue;
                 // Dragon containers are INVARIANT, but a fresh literal arg of a
                 // covariant element type (`main([SubTest()])` -> list[TestCase])
-                // is sound and idiomatic. Distinguishing fresh-literal covariance
-                // from unsound aliasing isn't worth it here, so defer when both
-                // sides are the same container kind. Scalar and cross-category
-                // mismatches (str->int, str->list) are still caught.
-                if (isContainer(ak) && ak == pk) continue;
+                // is sound and idiomatic: bless it via tryExpectedTypeLiteral,
+                // which also forces the box representation for an Any element
+                // type. For NON-literal same-kind container args, defer as
+                // before - EXCEPT when the element layouts differ (list[T] vs
+                // list[Any]/list[union]): passing a monomorphized list as a
+                // box-element list walks the wrong stride inside the callee,
+                // so that specific aliasing is rejected here.
+                if (isContainer(ak) && ak == pk) {
+                    // An EMPTY container literal adopts the param type - the
+                    // same contextual typing `x: list[T] = []` gets - so
+                    // `f([])` builds the param's representation.
+                    if (auto* le = dynamic_cast<ListExpr*>(node.args[i].get())) {
+                        if (le->elements.empty()) {
+                            propagateAnnotationToEmptyLiteral(
+                                node.args[i].get(), pt);
+                            continue;
+                        }
+                    } else if (auto* de =
+                                   dynamic_cast<DictExpr*>(node.args[i].get())) {
+                        if (de->entries.empty()) {
+                            propagateAnnotationToEmptyLiteral(
+                                node.args[i].get(), pt);
+                            continue;
+                        }
+                    }
+                    if (tryExpectedTypeLiteral(node.args[i].get(), pt)) continue;
+                    if (ak == Type::Kind::List) {
+                        const auto& ae =
+                            static_cast<const ListType&>(*at).elementType;
+                        const auto& pe =
+                            static_cast<const ListType&>(*pt).elementType;
+                        // Only judge when both element types are known - an
+                        // Unknown element carries no representation claim.
+                        if (ae && pe && ae->kind() != Type::Kind::Unknown &&
+                            pe->kind() != Type::Kind::Unknown) {
+                            auto boxElem = [](const Type::Kind k) {
+                                return k == Type::Kind::Any ||
+                                       k == Type::Kind::Union;
+                            };
+                            if (boxElem(ae->kind()) != boxElem(pe->kind())) {
+                                error(node.args[i]->location(),
+                                      "argument " + std::to_string(i + 1) +
+                                      " of type '" + at->toString() +
+                                      "' is not assignable to parameter type '" +
+                                      pt->toString() + "'" +
+                                      TypeChecker::listReprMismatchHint(*at, *pt));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if (!at->isSubtypeOf(*pt)) {
                     error(node.args[i]->location(),
                           "argument " + std::to_string(i + 1) + " of type '" +
@@ -1484,7 +1575,42 @@ void TypeChecker::visit(LambdaExpr& node) {
         paramTypes.push_back(pType);
     }
     auto retType = resolveType(node.returnType.get());
-    node.type = std::make_shared<FunctionType>(std::move(paramTypes), retType);
+    node.type = std::make_shared<FunctionType>(paramTypes, retType);
+
+    // Type-check the body, exactly as visit(FunctionDecl) does for a def.
+    // Before this walk existed nothing inside a lambda was ever type-checked:
+    // `bad: int = "boy"` compiled clean, and a generic method call in a
+    // handler (`db.all[dict[str, Any]](sql)`) was never stamped/retargeted by
+    // the D044 worklist - codegen then either errored loudly ("no codegen
+    // dispatch path matched", the bare-inference form) or, worse, resolved
+    // nothing and produced an empty default silently (the explicit-args
+    // form). The guard runs the walk once per checker instance (a def body
+    // gets the same once-per-walk cadence); node.type above is still set on
+    // every visit.
+    if (!impl_->checkedLambdaBodies.insert(&node).second) return;
+
+    impl_->pushScope();
+    impl_->returnTypeStack.push_back(retType);
+    for (size_t i = 0; i < node.params.size(); ++i) {
+        impl_->define(node.params[i].name, paramTypes[i]);
+    }
+    if (node.body) {
+        // Expression lambda: the body IS the return value - same
+        // Unknown-gated assignability check as visit(ReturnStmt).
+        auto bodyType = inferType(node.body.get());
+        if (retType->kind() != Type::Kind::Unknown &&
+            bodyType->kind() != Type::Kind::Unknown &&
+            !bodyType->isAssignableTo(*retType)) {
+            error(node.location(), "lambda body type '" + bodyType->toString() +
+                  "' does not match declared return type '" +
+                  retType->toString() + "'");
+        }
+    }
+    for (auto& s : node.bodyStmts) {
+        s->accept(*this);
+    }
+    impl_->returnTypeStack.pop_back();
+    impl_->popScope();
 }
 
 void TypeChecker::visit(IfExpr& node) {

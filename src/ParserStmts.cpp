@@ -92,6 +92,16 @@ std::unique_ptr<Stmt> Parser::statement() {
         return enumDeclaration();
     }
 
+    // Contextual keyword: `own f: T` sole-owner field marker (docs/001-memory).
+    // Two consecutive identifiers cannot start any other statement (`own = 5`,
+    // `own(x)`, `own.f` all differ at the second token), so one-token
+    // lookahead disambiguates and code using `own` as a name keeps compiling.
+    if (impl_->options.isDragonFile &&
+        check(TokenType::IDENTIFIER) && current().lexeme() == "own" &&
+        peekNext().type() == TokenType::IDENTIFIER) {
+        return ownDeclaration();
+    }
+
     // Dragon-specific keywords (.dr mode only)
     if (impl_->options.isDragonFile && check(TokenType::EXTERN)) {
         return externDeclaration();
@@ -140,6 +150,42 @@ std::unique_ptr<Stmt> Parser::simpleStatement() {
 }
 
 std::unique_ptr<Stmt> Parser::compoundStatement() { return statement(); }
+
+// Assignment RHS that may be a MOVE: `self._f = own x` transfers the
+// binding's +1 into an own field (docs/002 2.4 row 3 / 2.8). Same contextual
+// shape as the call-argument form; anything else parses as a normal
+// expression (`x = own + 1` still works for a variable named own).
+std::unique_ptr<Expr> Parser::maybeMoveRhs() {
+    if (impl_->options.isDragonFile && check(TokenType::IDENTIFIER) &&
+        current().lexeme() == "own" &&
+        peekNext().type() == TokenType::IDENTIFIER) {
+        advance();  // 'own'
+        auto moved = std::make_unique<NameExpr>();
+        moved->name = std::string(
+            consume(TokenType::IDENTIFIER,
+                    "Expect binding name after 'own'").lexeme());
+        moved->setLocation(previous().location());
+        moved->isMoveMarked = true;
+        if (check(TokenType::DOT) || check(TokenType::LEFT_BRACKET))
+            error("own moves a BINDING; a field or element cannot be moved "
+                  "(its container owns it) - bind it first or dub it");
+        return moved;
+    }
+    // `mine = dub base` - a fresh, independent, priced copy (docs/002 2.7).
+    if (impl_->options.isDragonFile && check(TokenType::IDENTIFIER) &&
+        current().lexeme() == "dub" &&
+        peekNext().type() == TokenType::IDENTIFIER) {
+        advance();  // 'dub'
+        auto dubbed = std::make_unique<NameExpr>();
+        dubbed->name = std::string(
+            consume(TokenType::IDENTIFIER,
+                    "Expect binding name after 'dub'").lexeme());
+        dubbed->setLocation(previous().location());
+        dubbed->isDubMarked = true;
+        return dubbed;
+    }
+    return expression();
+}
 
 std::unique_ptr<Stmt> Parser::expressionStatement() {
     // Statement location = its first token (the LHS target / expression).
@@ -235,7 +281,7 @@ std::unique_ptr<Stmt> Parser::expressionStatement() {
         // NEWLINE between the `=` and the RHS is purely cosmetic
         // continuation (Python multi-line assignment).
         skipNewlines();
-        auto rhsFirst = expression();
+        auto rhsFirst = maybeMoveRhs();
         if (check(TokenType::COMMA)) {
             auto rhsTuple = std::make_unique<TupleExpr>();
             rhsTuple->elements.push_back(std::move(rhsFirst));
@@ -259,7 +305,7 @@ std::unique_ptr<Stmt> Parser::expressionStatement() {
             // Same rationale as above: `=` commits to a RHS, so allow a
             // line break between the `=` and the start of the expression.
             skipNewlines();
-            stmt->value = expression();
+            stmt->value = maybeMoveRhs();
         }
         return stmt;
     }
@@ -475,7 +521,23 @@ std::unique_ptr<Stmt> Parser::forStatement() {
         stmt->target = std::move(target);
     }
     consume(TokenType::IN, "Expect 'in'");
-    stmt->iterable = expression();
+    // `for x in dub names` - snapshot iteration (docs/002 2.7/E17): the loop
+    // walks a priced copy evaluated once, so mutating the original inside
+    // the body is well-defined.
+    if (impl_->options.isDragonFile && check(TokenType::IDENTIFIER) &&
+        current().lexeme() == "dub" &&
+        peekNext().type() == TokenType::IDENTIFIER) {
+        advance();  // 'dub'
+        auto dubbed = std::make_unique<NameExpr>();
+        dubbed->name = std::string(
+            consume(TokenType::IDENTIFIER,
+                    "Expect binding name after 'dub'").lexeme());
+        dubbed->setLocation(previous().location());
+        dubbed->isDubMarked = true;
+        stmt->iterable = std::move(dubbed);
+    } else {
+        stmt->iterable = expression();
+    }
     stmt->body = parseBlock();
     if (match(TokenType::ELSE)) stmt->elseBody = parseBlock();
     return stmt;
@@ -603,6 +665,30 @@ std::unique_ptr<Stmt> Parser::constDeclaration() {
     stmt->typeAnnotation = std::move(tupAnn);
     stmt->value = std::move(value);
     stmt->isConst = true;
+    return stmt;
+}
+
+std::unique_ptr<Stmt> Parser::ownDeclaration() {
+    // `own f: T [= value]` - sole-owner field marker (docs/001-memory.md).
+    // The `own` identifier itself was matched contextually by statement().
+    auto loc = current().location();
+    advance();  // consume 'own'
+    auto name = std::make_unique<NameExpr>();
+    name->name = std::string(
+        consume(TokenType::IDENTIFIER, "Expect field name after 'own'").lexeme());
+    name->setLocation(previous().location());
+    consume(TokenType::COLON, "Expect ':' after own field name");
+    auto annotation = parseType();
+    std::unique_ptr<Expr> value;
+    if (match(TokenType::EQUAL)) {
+        value = expression();
+    }
+    auto stmt = std::make_unique<AnnAssignStmt>();
+    stmt->setLocation(loc);
+    stmt->target = std::move(name);
+    stmt->annotation = std::move(annotation);
+    stmt->value = std::move(value);
+    stmt->isOwn = true;
     return stmt;
 }
 
@@ -1469,6 +1555,14 @@ std::vector<Parameter> Parser::parseParameters() {
             param.isKwArg = true;
             param.name = std::string(consume(TokenType::IDENTIFIER, "Expect parameter name").lexeme());
         } else {
+            // `own p: T` - the callee owns the parameter (docs/002 2.8).
+            // Contextual: two consecutive identifiers cannot otherwise start
+            // a parameter, so a parameter NAMED own keeps compiling.
+            if (check(TokenType::IDENTIFIER) && current().lexeme() == "own" &&
+                peekNext().type() == TokenType::IDENTIFIER) {
+                advance();
+                param.isOwn = true;
+            }
             param.name = std::string(consume(TokenType::IDENTIFIER, "Expect parameter name").lexeme());
         }
         if (match(TokenType::COLON)) param.type = parseType();

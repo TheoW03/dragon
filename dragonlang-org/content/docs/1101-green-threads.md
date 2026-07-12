@@ -40,6 +40,35 @@ pool of OS threads (an "M:N" scheduler), so each costs about 64 KB instead of th
 does I/O - a socket read, a database query - the runtime quietly parks it and runs
 another, instead of blocking the underlying OS thread.
 
+## What may cross into a green thread
+
+A green thread runs concurrently with the code that fired it, so every heap
+value that crosses the `fire` boundary must arrive in a way that cannot race.
+There are four doors, and anything else is a compile error at the fire line:
+
+```dragon
+req: Request = parse_request(conn)      # this function still owns req
+counts: dict[str, int] = load_counts()
+
+fire handle(req)              # error E12: 'req' crosses a thread boundary;
+                              # move it (own req), copy it (dub req),
+                              # or make it a locked type
+
+fire handle(own req)          # door 1: moved - the green thread becomes the
+                              #         sole owner; req is dead on this side
+fire tally(dub counts)        # door 2: copied - the green thread gets its own
+fire banner(GREETING)         # door 3: an immortal const string literal
+fire record(router)           # door 4: an internally-locked type
+```
+
+Door 1 is the default to reach for: a moved value belongs to exactly one
+thread, proven at compile time, so there is no lock to take and no data race
+to debug. Use door 2 when this side still needs the value, and door 4 (a
+class whose storage is guarded by an `own` Lock field, like the HTTP
+`Router`) when threads genuinely must share mutable state. The full rules
+live in [Ownership](/docs/1604-ownership); the lock types in
+[Synchronization](/docs/1104-synchronization).
+
 ## Task handles: `Task[T]`
 
 When you want a result back, bind the `fire` to a variable. `fire` returns a

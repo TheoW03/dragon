@@ -1467,8 +1467,11 @@ const char* dragon_template_escape_url(const char* s) {
 }
 
 // Build a dict[str, str] snapshot of the process environment. Backs Python's
-// `os.environ` (a mapping) - distinct from os.getenv(name). Keys are interned
-// (dict-key convention); values are heap DragonStrings tagged TAG_STR.
+// `os.environ` (a mapping) - distinct from os.getenv(name). Keys and values
+// are ordinary owned heap DragonStrings the dict's key/value release paths
+// reclaim. Keys used to be dragon_str_intern'd (immortal, no dedup): os.dr
+// builds environ once at import so it was bounded in practice, but any repeat
+// caller leaked one immortal key per env var per call (AUDIT-2026-07-09 2.1).
 DragonDict* dragon_environ_dict(void) {
     DragonDict* d = dragon_dict_new(64);
 #if defined(_WIN32)
@@ -1485,7 +1488,7 @@ DragonDict* dragon_environ_dict(void) {
             const char* entry = *e;
             const char* eq = strchr(entry, '=');
             if (!eq) continue;  // skip malformed entries with no '='
-            const char* key = dragon_str_intern(entry, (int64_t)(eq - entry));
+            const char* key = dragon_string_alloc(entry, (int64_t)(eq - entry));
             const char* val = dragon_string_alloc(eq + 1, (int64_t)strlen(eq + 1));
             dragon_dict_set_tagged(d, key, (int64_t)(intptr_t)val, TAG_STR);
         }

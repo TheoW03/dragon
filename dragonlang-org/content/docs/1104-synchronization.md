@@ -11,14 +11,17 @@ it on exit even if the body raises.
 `Lock` guards a critical section: only one thread holds it at a time. It needs the
 import (`from threading import Lock`), and the idiomatic pattern wraps the shared
 state in a class with a field holding the `Lock` that guards it - keeping the data
-and its lock together makes the invariant obvious:
+and its lock together makes the invariant obvious. A `Lock` field must be declared
+`own`: a Lock is not a reference-counted object, and the `own` field is what
+destroys it when its holder dies (see [Ownership](/docs/1604-ownership)). The
+compiler enforces this; a plain `Lock` field does not compile.
 
 ```dragon
 from threading import Lock, Thread
 
 class Counter {
     value: int = 0
-    lock: Lock = Lock()
+    own lock: Lock = Lock()
 
     def bump() -> None {
         with self.lock {

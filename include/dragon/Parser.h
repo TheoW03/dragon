@@ -158,6 +158,8 @@ private:
     // Dragon-specific (.dr mode)
     std::unique_ptr<Stmt> constDeclaration();
     std::unique_ptr<Stmt> staticDeclaration();
+    std::unique_ptr<Stmt> ownDeclaration();
+    std::unique_ptr<Expr> maybeMoveRhs();
     std::unique_ptr<Stmt> externDeclaration();
     std::unique_ptr<Stmt> parseExternFuncSig(const std::string& libHint);
 

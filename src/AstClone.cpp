@@ -6,7 +6,29 @@
 
 #include "dragon/AstClone.h"
 
+#include <cassert>
+#include <cstdio>
+#include <typeinfo>
+
 namespace dragon {
+
+namespace {
+// A missing clone case is an internal compiler error, not a silent drop: the
+// monomorphizer consumes a null clone with `if (!cloned) continue;`, so a new
+// AST node added without an AstClone case would silently omit a stamped
+// statement / null a sub-expression and miscompile the generic instantiation
+// (AUDIT-2026-07-09 Tier 5.4). Fire loudly on every build (stderr) and abort
+// under assertions so tests catch it, instead of the old quiet nullptr.
+[[maybe_unused]] std::nullptr_t cloneMissingCase(const char* kind,
+                                                 const ASTNode& node) {
+    std::fprintf(stderr,
+        "internal compiler error: AstClone has no case for %s node '%s' "
+        "(generic monomorphization would silently drop it); add a clone case\n",
+        kind, typeid(node).name());
+    assert(false && "AstClone: missing node case (see stderr)");
+    return nullptr;
+}
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // Small helpers
@@ -40,6 +62,7 @@ Parameter cloneParam(const Parameter& p, const TypeSubst& subst) {
     q.defaultValue = cloneExpr(p.defaultValue.get(), subst);
     q.isVarArg = p.isVarArg;
     q.isKwArg = p.isKwArg;
+    q.isOwn = p.isOwn;
     return q;
 }
 
@@ -238,7 +261,10 @@ std::unique_ptr<Expr> cloneExpr(const Expr* e, const TypeSubst& subst) {
         if (it != subst.end()) {
             if (auto v = typeExprToValueExpr(it->second)) { v->setLocation(e->location()); return v; }
         }
-        auto r = std::make_unique<NameExpr>(); r->name = n->name; setLoc(r, *e); return r;
+        auto r = std::make_unique<NameExpr>(); r->name = n->name;
+        r->isMoveMarked = n->isMoveMarked;
+        r->isDubMarked = n->isDubMarked;
+        setLoc(r, *e); return r;
     }
     if (auto* n = dynamic_cast<const BinaryExpr*>(e)) {
         auto r = std::make_unique<BinaryExpr>();
@@ -436,7 +462,7 @@ std::unique_ptr<Expr> cloneExpr(const Expr* e, const TypeSubst& subst) {
         setLoc(r, *e);
         return r;
     }
-    return nullptr;
+    return cloneMissingCase("Expr", *e);
 }
 
 //===----------------------------------------------------------------------===//
@@ -483,6 +509,7 @@ std::unique_ptr<Stmt> cloneStmt(const Stmt* s, const TypeSubst& subst) {
         r->value = cloneExpr(n->value.get(), subst);
         r->isConst = n->isConst;
         r->isStatic = n->isStatic;
+        r->isOwn = n->isOwn;
         setLoc(r, *s);
         return r;
     }
@@ -602,6 +629,7 @@ std::unique_ptr<Stmt> cloneStmt(const Stmt* s, const TypeSubst& subst) {
     if (auto* n = dynamic_cast<const DeleteStmt*>(s)) {
         auto r = std::make_unique<DeleteStmt>();
         r->targets = cloneExprVec(n->targets, subst);
+        r->provenUnique = n->provenUnique;
         setLoc(r, *s);
         return r;
     }
@@ -678,7 +706,7 @@ std::unique_ptr<Stmt> cloneStmt(const Stmt* s, const TypeSubst& subst) {
         setLoc(r, *s);
         return r;
     }
-    return nullptr;
+    return cloneMissingCase("Stmt", *s);
 }
 
 }  // namespace dragon

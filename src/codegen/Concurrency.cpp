@@ -186,6 +186,16 @@ void CodeGen::visit(FireExpr& node) {
         auto kindsIt = impl_->funcParamKinds.find(calleeName);
         if (kindsIt != impl_->funcParamKinds.end()) argKinds = kindsIt->second;
 
+        // docs/002 2.8/2.9: `fire consume(own o)` - the caller's +1 MOVES
+        // with the value, and the callee's own-param scope exit releases it.
+        // Neutralize the kind so BOTH halves of the borrow pair skip it (the
+        // fire-site atomic incref here, the trampoline's post-call decref in
+        // buildFireTrampoline) - keeping the pair double-freed the moved
+        // object (A/B-proven by the spawn-lend probe).
+        for (size_t i = 0; i < userArgs.size() && i < argKinds.size(); i++)
+            if (impl_->paramIsOwn(calleeName, (unsigned)i))
+                argKinds[i] = Impl::VarKind::Other;
+
         // Atomic-incref heap args at the call site so they survive on the
         // worker thread until the trampoline atomic-decrefs them post-call.
         for (size_t i = 0; i < userArgs.size() && i < argKinds.size(); i++)
@@ -229,6 +239,10 @@ void CodeGen::visit(FireExpr& node) {
         {trampAsI8, argsAsI8,
          llvm::ConstantInt::get(impl_->i64Type, (int64_t)argsSize)},
         "vthread");
+    // `fire f(own x)`: the args struct now carries the moved +1 - null the
+    // caller's slot so its scope exit sees nothing (docs/002 2.8).
+    if (auto* movedCall = dynamic_cast<CallExpr*>(node.operand.get()))
+        impl_->emitMoveOutSlots(*movedCall);
 }
 
 void CodeGen::visit(AwaitExpr& node) {

@@ -565,6 +565,21 @@ void dragon_list_reverse(DragonList* list) {
     dragon_shared_mut_end(&list->header, mut_armed);
 }
 
+/// dub (docs/002 2.7): deep copy - the spine is fresh and every element is
+/// deep-copied by tag (immutable str/bytes elements identity-retain, nested
+/// lists/dicts recurse). dragon_deep_copy_tagged returns +1 per element and
+/// dragon_list_append adopts it, mirroring dragon_list_copy's ownership
+DragonList* dragon_list_deep_copy(DragonList* list) {
+    DragonList* copy = dragon_list_new_tagged(
+        list->size > 0 ? list->size : 8, list->elem_tag);
+    for (int64_t i = 0; i < list->size; i++) {
+        int64_t elem = dragon_list_load(list, i);
+        dragon_list_append(copy,
+                           dragon_deep_copy_tagged(elem, list->elem_tag));
+    }
+    return copy;
+}
+
 /// Shallow copy (returns new list)
 DragonList* dragon_list_copy(DragonList* list) {
     DragonList* copy = dragon_list_new_tagged(list->size > 0 ? list->size : 8, list->elem_tag);
@@ -881,6 +896,22 @@ static inline void dragon_listbox_decref_elem(DragonListBoxElem* e) {
     else if (tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES)
         dragon_decref_dispatch((void*)(uintptr_t)e->payload);
     // TAG_INT / TAG_FLOAT / TAG_BOOL / TAG_NONE: no refcount to drop.
+    //
+    // TAG_CLOSURE (10) deliberately has NO decref arm yet - a WALL, not an
+    // oversight (AUDIT-2026-07-09 Tier 4). Codegen's boxArgTagPayload increfs
+    // BORROWED sources for tags 1/5/6/7 only, so `anyList.append(f)` with a
+    // borrowed Callable local stores a tag-10 payload at +0. Adding
+    // dragon_decref_callable here was ASan-PROVEN (2026-07-09) to double-free
+    // that shape: box destroy released a ref the box never took, then the
+    // local's scope-cleanup decref hit freed memory (heap-use-after-free in
+    // dragon_decref_callable). The known cost of the skip: box repeat/extend/
+    // concat's dragon_incref_tagged +1 on tag-10 payloads leaks (closures in
+    // a churned list[Any] extend), and a fresh lambda appended to list[Any]
+    // leaks its transferred +1. Fix ORDER: teach boxArgTagPayload
+    // (src/codegen/ImplMethods2.cpp) a litTag == 10 ->
+    // dragon_incref_callable arm FIRST, then land this decref arm, the
+    // dict_values_box incref mirror, and the tag-10 arms in
+    // dragon_list_box_traverse / dragon_list_box_clear_refs TOGETHER.
 }
 
 /// list[Any] allocation. capacity rounds up to at least 8 to match other variants.
@@ -926,6 +957,45 @@ DragonListBox* dragon_list_box_repeat(DragonListBox* src, int64_t count) {
         }
     }
     return result;
+}
+
+/// Representation check for unboxing a box-tagged (TAG_LIST) payload into a
+/// typed list view. The box tag alone says "some list" - it cannot tell a
+/// monomorphized DragonList (8B/elem native storage) from a DragonListBox
+/// (16B/elem {tag, payload} storage). Reading one at the other's stride is
+/// silent value corruption or OOB, so a typed unbox must verify the payload's
+/// HEADER first:
+///   want_elem_tag == -1  -> the target is list[Any] / list[union]: require
+///                           DRAGON_TAG_LIST_BOX.
+///   want_elem_tag >=  0  -> the target is a concrete list[T]: require
+///                           DRAGON_TAG_LIST with a matching elem_tag.
+/// No empty-list exemption: a cross-representation view of an empty list
+/// would still APPEND through the wrong layout. Raises TypeError (80) on
+/// mismatch; a match returns and the caller uses the payload as-is (view, not
+/// copy - matching representation aliases safely).
+void dragon_list_view_check(void* p, int64_t want_elem_tag) {
+    if (!p) return;
+    DragonObjectHeader* h = (DragonObjectHeader*)p;
+    if (want_elem_tag < 0) {
+        if (h->type_tag == DRAGON_TAG_LIST_BOX) return;
+        dragon_raise_exc_cstr(80,
+            "TypeError: expected a boxed-element list (list[Any]) but the "
+            "value holds a monomorphized list (e.g. list[str]); build it with "
+            "element type Any at its declaration, or copy it element-wise");
+        return;
+    }
+    if (h->type_tag == DRAGON_TAG_LIST) {
+        DragonList* l = (DragonList*)p;
+        if ((int64_t)l->elem_tag == want_elem_tag) return;
+        dragon_raise_exc_cstr(80,
+            "TypeError: list element type does not match the annotated "
+            "element type (the value holds a differently-monomorphized list)");
+        return;
+    }
+    dragon_raise_exc_cstr(80,
+        "TypeError: expected a monomorphized list (concrete element type) but "
+        "the value holds a boxed-element list (list[Any]); read it as "
+        "list[Any] and narrow per element, or copy it element-wise");
 }
 
 /// Read element `index` as a 16-byte {tag, payload} box.

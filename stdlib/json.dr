@@ -9,7 +9,7 @@
 #
 # Also home to the JSON `template[JSON]` content type (D032 domain
 # co-location). The module-level `escape(s)` and JSON's `@staticmethod escape`
-# are distinct namespaces and do not collide.
+# are distinct namespaces and do not collide
 
 from template import Template
 
@@ -1092,3 +1092,330 @@ class JSON(Template) {
     }
 }
 
+
+#===----------------------------------------------------------------------===#
+# JSON Schema validation engine (practical Draft-7 subset).
+#
+# Compile once, validate many:
+#
+#   const schema: Schema = json.compile('{"type": "object", "required": ["id"]}')
+#   const result: ValidationResult = schema.validate(json.loads(body))
+#   if not result.ok {
+#       for e in result.errors { print(f"{e.path}: {e.message}") }
+#   }
+#
+# Or through the named registry (compile-and-cache, the amebo pattern):
+#
+#   json.register("order.placed", schematext)
+#   const r: ValidationResult = json.validate("order.placed", payload)
+#
+# Supported keywords: type (a name or a list of names), enum (deep equality),
+# object: required / properties; array: items / minItems / maxItems;
+# string: minLength / maxLength; number: minimum / maximum (integer and number
+# alike). Unknown keywords are ignored, like every JSON Schema validator.
+# Spec-honest semantics: "number" accepts integers, "integer" rejects
+# fractions, and booleans are never integers.
+#===----------------------------------------------------------------------===#
+
+# The JSON kind of a runtime value, in JSON Schema's own vocabulary:
+# "string" | "integer" | "number" | "boolean" | "array" | "object" | "null".
+def kind_of(v: Any) -> str {
+    if isinstance(v, bool) {
+        return "boolean"
+    }
+    if isinstance(v, int) {
+        return "integer"
+    }
+    if isinstance(v, float) {
+        return "number"
+    }
+    if isinstance(v, str) {
+        return "string"
+    }
+    if isinstance(v, list) {
+        return "array"
+    }
+    if isinstance(v, dict) {
+        return "object"
+    }
+    return "null"
+}
+
+
+def _type_matches(want: str, kind: str) -> bool {
+    if want == kind {
+        return True
+    }
+    # JSON Schema: every integer is also a number.
+    return want == "number" and kind == "integer"
+}
+
+
+# A numeric Any (int or float) as float, for bound comparisons.
+def _num_val(v: Any) -> float {
+    if isinstance(v, int) {
+        const i: int = v
+        return float(i)
+    }
+    const f: float = v
+    return f
+}
+
+
+# Deep equality across two parsed JSON values (enum membership).
+def _json_eq(a: Any, b: Any) -> bool {
+    const ka: str = kind_of(a)
+    const kb: str = kind_of(b)
+    if ka != kb {
+        return False
+    }
+    if ka == "null" {
+        return True
+    }
+    if ka == "boolean" {
+        const x: bool = a
+        const y: bool = b
+        return x == y
+    }
+    if ka == "integer" {
+        const x: int = a
+        const y: int = b
+        return x == y
+    }
+    if ka == "number" {
+        const x: float = a
+        const y: float = b
+        return x == y
+    }
+    if ka == "string" {
+        const x: str = a
+        const y: str = b
+        return x == y
+    }
+    if ka == "array" {
+        const xs: list[Any] = a
+        const ys: list[Any] = b
+        if len(xs) != len(ys) {
+            return False
+        }
+        i: int = 0
+        while i < len(xs) {
+            if not _json_eq(xs[i], ys[i]) {
+                return False
+            }
+            i = i + 1
+        }
+        return True
+    }
+    const xd: dict[str, Any] = a
+    const yd: dict[str, Any] = b
+    if len(xd) != len(yd) {
+        return False
+    }
+    for k in xd {
+        if not (k in yd) {
+            return False
+        }
+        if not _json_eq(xd[k], yd[k]) {
+            return False
+        }
+    }
+    return True
+}
+
+
+# One violation: the JSON path of the offending value and what went wrong.
+class ValidationError {
+    path: str
+    message: str
+
+    def(path: str, message: str) {
+        self.path = path
+        self.message = message
+    }
+}
+
+
+class ValidationResult {
+    ok: bool
+    errors: list[ValidationError]
+
+    def(errors: list[ValidationError]) {
+        self.errors = errors
+        self.ok = len(errors) == 0
+    }
+}
+
+
+def _schema_check(schema: dict[str, Any], value: Any, path: str,
+                  errors: list[ValidationError]) -> None {
+    const kind: str = kind_of(value)
+
+    if "type" in schema {
+        matched: bool = False
+        want: str = ""
+        const tv: Any = schema["type"]
+        if isinstance(tv, str) {
+            const t: str = tv
+            want = t
+            matched = _type_matches(t, kind)
+        }
+        if isinstance(tv, list) {
+            const ts: list[Any] = tv
+            names: list[str] = []
+            for t0 in ts {
+                const t1: str = t0
+                names.append(t1)
+                if _type_matches(t1, kind) {
+                    matched = True
+                }
+            }
+            want = " or ".join(names)
+        }
+        if not matched {
+            errors.append(ValidationError(path, f"expected {want}, got {kind}"))
+            # The wrong kind - none of the kind-specific keywords below apply.
+            return
+        }
+    }
+
+    if "enum" in schema {
+        const allowed: list[Any] = schema["enum"]
+        found: bool = False
+        for a in allowed {
+            if _json_eq(a, value) {
+                found = True
+            }
+        }
+        if not found {
+            errors.append(ValidationError(path, "value not in enum"))
+        }
+    }
+
+    if kind == "string" {
+        const s: str = value
+        if "minLength" in schema {
+            const m: int = schema["minLength"]
+            if len(s) < m {
+                errors.append(ValidationError(path, f"string shorter than minLength {m}"))
+            }
+        }
+        if "maxLength" in schema {
+            const m: int = schema["maxLength"]
+            if len(s) > m {
+                errors.append(ValidationError(path, f"string longer than maxLength {m}"))
+            }
+        }
+    }
+
+    if kind == "integer" or kind == "number" {
+        const n: float = _num_val(value)
+        if "minimum" in schema {
+            const m: float = _num_val(schema["minimum"])
+            if n < m {
+                errors.append(ValidationError(path, "value below minimum"))
+            }
+        }
+        if "maximum" in schema {
+            const m: float = _num_val(schema["maximum"])
+            if n > m {
+                errors.append(ValidationError(path, "value above maximum"))
+            }
+        }
+    }
+
+    if kind == "array" {
+        const xs: list[Any] = value
+        if "minItems" in schema {
+            const m: int = schema["minItems"]
+            if len(xs) < m {
+                errors.append(ValidationError(path, f"fewer than minItems {m}"))
+            }
+        }
+        if "maxItems" in schema {
+            const m: int = schema["maxItems"]
+            if len(xs) > m {
+                errors.append(ValidationError(path, f"more than maxItems {m}"))
+            }
+        }
+        if "items" in schema {
+            const isch: dict[str, Any] = schema["items"]
+            i: int = 0
+            for x in xs {
+                _schema_check(isch, x, f"{path}[{i}]", errors)
+                i = i + 1
+            }
+        }
+    }
+
+    if kind == "object" {
+        const obj: dict[str, Any] = value
+        if "required" in schema {
+            const req: list[Any] = schema["required"]
+            for r in req {
+                const name: str = r
+                if not (name in obj) {
+                    errors.append(ValidationError(f"{path}.{name}", "required property missing"))
+                }
+            }
+        }
+        if "properties" in schema {
+            const props: dict[str, Any] = schema["properties"]
+            for name in props {
+                if name in obj {
+                    const sub: dict[str, Any] = props[name]
+                    _schema_check(sub, obj[name], f"{path}.{name}", errors)
+                }
+            }
+        }
+    }
+}
+
+
+# A compiled schema: parsed once, validated against many values.
+class Schema {
+    _schema: dict[str, Any]
+
+    def(schema: dict[str, Any]) {
+        self._schema = schema
+    }
+
+    def validate(value: Any) -> ValidationResult {
+        errors: list[ValidationError] = []
+        _schema_check(self._schema, value, "$", errors)
+        return ValidationResult(errors)
+    }
+}
+
+
+# Compile JSON Schema text into a Schema. Raises like loads_obj on malformed
+# JSON; the text must be a JSON object.
+def compile(schema: str) -> Schema {
+    return Schema(loads_obj(schema))
+}
+
+
+# Compile an already-parsed (or literal-built) schema object.
+def compile_obj(schema: dict[str, Any]) -> Schema {
+    return Schema(schema)
+}
+
+
+# Named registry: compile once under a name, validate many times by name -
+# the broker pattern (amebo compiles each action's schema on registration).
+# Registration mutates module state; do it at startup, not concurrently from
+# server worker threads.
+_schemas: dict[str, Schema] = {}
+
+def register(name: str, schema: str) -> None {
+    _schemas[name] = compile(schema)
+}
+
+def registered(name: str) -> bool {
+    return name in _schemas
+}
+
+def validate(name: str, value: Any) -> ValidationResult {
+    const s: Schema = _schemas[name]
+    return s.validate(value)
+}

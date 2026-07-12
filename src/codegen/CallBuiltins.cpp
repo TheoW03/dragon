@@ -825,11 +825,15 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
     // bool() conversion
     if (name == "bool" && node.args.size() == 1) {
         node.args[0]->accept(*this);
+        // bool() only READS its arg - an owned temp (`bool([])`,
+        // `bool(s.strip())`) is drained by the common argTemps tail.
+        llvm::Value* arg = impl_->trackBorrowTemp(node.args[0].get(),
+                                                  impl_->lastValue, argTemps);
         // Single source of truth: identical truthiness to if/while conditions
         // (numeric != 0; container/string len != 0; __bool__/__len__; else
         // non-null). Previously this returned constant-true for every pointer,
         // so bool("")/bool([]) were wrongly True.
-        impl_->lastValue = impl_->toBool(impl_->lastValue, node.args[0].get());
+        impl_->lastValue = impl_->toBool(arg, node.args[0].get());
         return true;
     }
 
@@ -1407,8 +1411,10 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
                 break;
             default: typeName = "object"; break;
         }
-        // Evaluate arg for side effects
+        // Evaluate arg for side effects; an owned temp (`type(Dog("rex"))`
+        // builds an instance nobody keeps) is drained by the argTemps tail.
         node.args[0]->accept(*this);
+        impl_->trackBorrowTemp(node.args[0].get(), impl_->lastValue, argTemps);
         impl_->lastValue = impl_->builder->CreateGlobalString(typeName);
         return true;
     }
@@ -1605,9 +1611,13 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
     // runtime converter handles every element type.
     if (name == "tuple" && node.args.size() == 1) {
         node.args[0]->accept(*this);
+        // The converter COPIES the elements into a fresh tuple - an owned
+        // list temp (`tuple([1, 2, 3])`) is drained by the argTemps tail.
+        llvm::Value* arg = impl_->trackBorrowTemp(node.args[0].get(),
+                                                  impl_->lastValue, argTemps);
         auto* fn = impl_->getOrDeclareRuntime("dragon_tuple_from_list",
             llvm::FunctionType::get(impl_->i8PtrType, {impl_->i8PtrType}, false));
-        impl_->lastValue = impl_->builder->CreateCall(fn, {impl_->lastValue}, "tuplefromlist");
+        impl_->lastValue = impl_->builder->CreateCall(fn, {arg}, "tuplefromlist");
         return true;
     }
 

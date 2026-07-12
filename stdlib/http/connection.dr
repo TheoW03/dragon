@@ -38,7 +38,7 @@ extern "C" def dragon_str_find(haystack: str, needle: str) -> int
 extern "C" def dragon_str_lower(s: str) -> str
 extern "C" def dragon_str_strip(s: str) -> str
 extern "C" def dragon_str_startswith(s: str, prefix: str) -> int
-extern "C" def dragon_str_join(sep: str, parts: list) -> str
+extern "C" def dragon_str_join(sep: str, parts: list[str]) -> str
 extern "C" def dragon_str_byte_len_pub(s: str) -> int
 extern "C" def dragon_int_to_str(n: int) -> str
 extern "C" def dragon_ord(s: str) -> int

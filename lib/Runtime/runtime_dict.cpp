@@ -16,6 +16,36 @@ void dragon_print_list_nested_raw(DragonList* l);
 void dragon_print_dict_nested_raw(DragonDict* d);
 void dragon_print_list_box_raw(DragonListBox* l);
 
+// Defined in runtime_builtins.cpp - class-id -> name for `<Name instance>`.
+const char* dragon_instance_class_name(void* instance);
+
+// Print one tag-7 dict value. TAG_BYTES == TAG_CLASS (both are generic
+// refcounted heap objects), so the tag alone cannot tell a DragonBytes from a
+// class instance - gate on the real header exactly like dragon_print_box_raw
+// (which fixed the same blind cast: printing an instance as fake bytes read
+// hundreds of KB out of bounds).
+static void dict_print_bytes_or_instance(int64_t value) {
+    DragonObjectHeader* h = (DragonObjectHeader*)(uintptr_t)value;
+    if (h && h->type_tag == DRAGON_TAG_BYTES) {
+        auto* bv = (DragonBytes*)h;
+        printf("b'");
+        for (int64_t bi = 0; bi < bv->len; bi++) {
+            uint8_t c = bv->data[bi];
+            if (c >= 32 && c < 127 && c != '\\' && c != '\'') printf("%c", c);
+            else if (c == '\\') printf("\\\\");
+            else if (c == '\'') printf("\\'");
+            else printf("\\x%02x", c);
+        }
+        printf("'");
+    } else if (!h) {
+        printf("None");
+    } else {
+        const char* nm = dragon_instance_class_name(h);
+        if (nm) printf("<%s instance>", nm);
+        else    printf("<object at 0x%llx>", (unsigned long long)value);
+    }
+}
+
 // Print one container-valued dict entry (TAG_LIST / TAG_DICT) tag-aware,
 // mirroring dragon_repr_value's header dispatch. Shared by both dict printers.
 static void dict_print_container_value(int64_t tag, int64_t value) {
@@ -579,19 +609,9 @@ void dragon_print_dict_raw(DragonDict* d) {
                 case TAG_NONE:
                     printf("None");
                     break;
-                case TAG_BYTES: {
-                    auto* bv = (DragonBytes*)(uintptr_t)d->entries[i].value;
-                    printf("b'");
-                    if (bv) for (int64_t bi = 0; bi < bv->len; bi++) {
-                        uint8_t c = bv->data[bi];
-                        if (c >= 32 && c < 127 && c != '\\' && c != '\'') printf("%c", c);
-                        else if (c == '\\') printf("\\\\");
-                        else if (c == '\'') printf("\\'");
-                        else printf("\\x%02x", c);
-                    }
-                    printf("'");
+                case TAG_BYTES:
+                    dict_print_bytes_or_instance(d->entries[i].value);
                     break;
-                }
                 case TAG_LIST:
                 case TAG_DICT:
                     dict_print_container_value(d->entries[i].tag,
@@ -629,19 +649,9 @@ void dragon_print_tagged_raw(int64_t value, int64_t tag) {
         case TAG_NONE:
             printf("None");
             break;
-        case TAG_BYTES: {
-            auto* bv = (DragonBytes*)(uintptr_t)value;
-            printf("b'");
-            if (bv) for (int64_t bi = 0; bi < bv->len; bi++) {
-                uint8_t c = bv->data[bi];
-                if (c >= 32 && c < 127 && c != '\\' && c != '\'') printf("%c", c);
-                else if (c == '\\') printf("\\\\");
-                else if (c == '\'') printf("\\'");
-                else printf("\\x%02x", c);
-            }
-            printf("'");
+        case TAG_BYTES:
+            dict_print_bytes_or_instance(value);
             break;
-        }
         default:
             printf("%ld", value);
             break;
@@ -742,7 +752,11 @@ DragonListBox* dragon_dict_values_box(DragonDict* d) {
         // STR/LIST/DICT/BYTES only. Deliberately NOT dragon_incref_tagged,
         // which would also incref a TAG_CLOSURE payload that box destroy does
         // not decref - that asymmetry would leak a closure-valued entry. If
-        // the box destroy ever learns TAG_CLOSURE, mirror it here too.
+        // the box destroy ever learns TAG_CLOSURE, mirror it here too. (The
+        // decref arm was attempted 2026-07-09 and walled by an ASan-proven
+        // double-free: see the WALL note in dragon_listbox_decref_elem,
+        // runtime_list.cpp - the codegen borrowed-append incref for tag 10
+        // must land first.)
         if (payload) {
             if (tag == TAG_STR)
                 dragon_incref_str((const char*)(uintptr_t)payload);
@@ -797,14 +811,19 @@ DragonDict* dragon_dict_fromkeys(DragonList* keys, int64_t value, int64_t tag) {
         // ASCII (NULL return → use the raw pointer) and UCS-4 paths.
         const char* keyData = (const char*)(uintptr_t)dragon_list_load(keys, i);
         if (!keyData) continue;
-        int64_t byteLen = 0;
-        char* utf8 = dragon_str_to_utf8_alloc(keyData, &byteLen);
-        const char* src = utf8 ? utf8 : keyData;
-        const char* internedKey = dragon_str_intern(src, byteLen);
-        if (utf8) free(utf8);
+        // The new-key store ADOPTS the key pointer (dragon_dict_set_tagged sets
+        // entries[ei].key = key with no dup), so the dict needs one owned ref.
+        // This used to dragon_str_intern the key: that allocated an IMMORTAL
+        // string with no dedup table, so every fromkeys call leaked one
+        // unfreeable string per key forever - unbounded RSS for a server
+        // calling fromkeys per request (AUDIT-2026-07-09 2.1). dragon_string_dup
+        // gives a normal mortal +1 the dict's key release path reclaims, and it
+        // already handles the ASCII / UCS-4 kinds, so the manual UTF-8 round
+        // trip is gone too.
+        const char* ownedKey = dragon_string_dup(keyData);
         // Each entry takes its own reference to the value.
         dragon_incref_tagged(value, tag);
-        dragon_dict_set_tagged(d, internedKey, value, tag);
+        dragon_dict_set_tagged(d, ownedKey, value, tag);
     }
     return d;
 }
@@ -1113,6 +1132,30 @@ DragonDict* dragon_dict_copy_excluding(DragonDict* d, const char** names,
         } else {
             dragon_dict_int_set_tagged(copy, (int64_t)(uintptr_t)d->entries[i].key,
                                        val, tag);
+        }
+    }
+    return copy;
+}
+
+/// dub (docs/002 2.7): deep copy - mirrors dragon_dict_copy's key handling
+/// exactly, but values deep-copy by tag (dragon_deep_copy_tagged returns +1;
+/// set_tagged adopts it, so ownership matches the shallow copy's contract).
+DragonDict* dragon_dict_deep_copy(DragonDict* d) {
+    DragonDict* copy = dragon_dict_new(d ? d->capacity : 4);
+    if (d) {
+        for (int64_t i = 0; i < d->size; i++) {
+            if (d->entries[i].dead) continue;
+            int64_t val = dragon_deep_copy_tagged(d->entries[i].value,
+                                                  d->entries[i].tag);
+            if (d->keys_are_ptr) {
+                dragon_incref_str(d->entries[i].key);
+                dragon_dict_set_tagged(copy, d->entries[i].key, val,
+                                       d->entries[i].tag);
+            } else {
+                dragon_dict_int_set_tagged(
+                    copy, (int64_t)(uintptr_t)d->entries[i].key, val,
+                    d->entries[i].tag);
+            }
         }
     }
     return copy;

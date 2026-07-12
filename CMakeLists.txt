@@ -45,6 +45,7 @@ set(DRAGON_SOURCES
     src/ParserStmts.cpp
     src/Sema.cpp
     src/DefiniteAssignment.cpp
+    src/OwnershipCheck.cpp
     src/TypeChecker.cpp
     src/TypeCheckerExprs.cpp
     src/TypeCheckerStmts.cpp

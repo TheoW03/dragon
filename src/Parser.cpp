@@ -527,6 +527,36 @@ std::unique_ptr<Expr> Parser::finishCall(std::unique_ptr<Expr> callee) {
                 advance();
                 advance();
                 callExpr->kwArgs.emplace_back(name, expression());
+            } else if (check(TokenType::IDENTIFIER) && peek().lexeme() == "dub" &&
+                       peekNext().type() == TokenType::IDENTIFIER) {
+                // `f(dub x)` - pass a priced copy, keep yours (docs/002 2.7).
+                advance();  // 'dub'
+                auto dubbed = std::make_unique<NameExpr>();
+                dubbed->name = std::string(
+                    consume(TokenType::IDENTIFIER,
+                            "Expect binding name after 'dub'").lexeme());
+                dubbed->setLocation(previous().location());
+                dubbed->isDubMarked = true;
+                callExpr->args.push_back(std::move(dubbed));
+            } else if (check(TokenType::IDENTIFIER) && peek().lexeme() == "own" &&
+                       peekNext().type() == TokenType::IDENTIFIER) {
+                // `f(own x)` - move argument (docs/002 2.8): the binding's +1
+                // transfers to the callee and x is Moved afterwards. A move
+                // is of a BINDING only; own field/element reads cannot move
+                // (their owner is the container). Ordered after the kwarg
+                // branch so `f(own=3)` stays a keyword argument.
+                advance();  // 'own'
+                auto moved = std::make_unique<NameExpr>();
+                moved->name = std::string(
+                    consume(TokenType::IDENTIFIER,
+                            "Expect binding name after 'own'").lexeme());
+                moved->setLocation(previous().location());
+                moved->isMoveMarked = true;
+                if (check(TokenType::DOT) || check(TokenType::LEFT_BRACKET))
+                    error("own moves a BINDING; a field or element cannot be "
+                          "moved (its container owns it) - bind it first or "
+                          "dub it");
+                callExpr->args.push_back(std::move(moved));
             } else {
                 callExpr->args.push_back(expression());
             }

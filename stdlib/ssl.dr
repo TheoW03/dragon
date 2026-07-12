@@ -93,12 +93,18 @@ def _raise_if_handshake_failed(rc: int, vr: int) -> None {
 #===----------------------------------------------------------------------===#
 
 class SSLSocket {
-    def(conn: ptr, sock: TcpStream, server_hostname: str) {
-        self._conn = conn
+    # Sole owner of the TLS engine connection: released exactly once, when
+    # the socket dies (docs/001-memory.md). close() releases EARLY with the
+    # graceful close_notify and nulls the handle; death-without-close frees
+    # the engine state without the protocol nicety.
+    own _conn: ptr
+
+    def(own conn: ptr, sock: TcpStream, server_hostname: str) {
+        self._conn = own conn
         self._sock = sock
         self.server_hostname = server_hostname
-        # Guards close() against a double free. There is no null-ptr literal to
-        # reset _conn to, so track closed-ness explicitly. See close().
+        # Guards close() against a double free and keeps sock.close()
+        # idempotent alongside the nulled handle. See close().
         self._closed = False
     }
 
@@ -184,6 +190,9 @@ class SSLSocket {
         self._closed = True
         dragon_tls_close(self._conn)
         dragon_tls_conn_free(self._conn)
+        # Null the handle: the own release at socket death is null-gated,
+        # so close() and the automatic release free exactly once.
+        self._conn = 0
         self._sock.close()
     }
 
@@ -202,6 +211,12 @@ class SSLSocket {
 #===----------------------------------------------------------------------===#
 
 class SSLContext {
+    # Sole owner of the mbedTLS engine context (~54KB+ per context incl.
+    # parsed CA / cert chains): released exactly once, when the context dies
+    # (docs/001-memory.md). close() may release EARLY for long-held contexts;
+    # it nulls the handle so the own release is a no-op afterwards.
+    own _ctx: ptr
+
     def(protocol: int = PROTOCOL_TLS_CLIENT) {
         self._is_server = (protocol == PROTOCOL_TLS_SERVER)
         srv: int = 0
@@ -209,6 +224,33 @@ class SSLContext {
             srv = 1
         }
         self._ctx = dragon_tls_ctx_new(srv)
+        self._closed = False
+    }
+
+    # Release the engine context (mbedTLS ctx + parsed CA / cert chains, ~54KB+
+    # per context). The context had no release path at all: dragon_tls_ctx_free
+    # was declared and never called from Dragon, so every SSLContext leaked its
+    # engine state (AUDIT-2026-07-09 2.2). Idempotent so `with` + a manual
+    # close() (or a double close) frees exactly once. A context is reusable
+    # across many connections, so this is caller-driven (like SSLSocket.close),
+    # not tied to any one wrap_socket.
+    def close() -> None {
+        if self._closed {
+            return
+        }
+        self._closed = True
+        dragon_tls_ctx_free(self._ctx)
+        # Null the handle: the own release at instance death is null-gated,
+        # so an early close() and the automatic release free exactly once.
+        self._ctx = 0
+    }
+
+    def __enter__() -> SSLContext {
+        return self
+    }
+    def __exit__() -> int {
+        self.close()
+        return 0
     }
 
     # CERT_NONE / CERT_OPTIONAL / CERT_REQUIRED.
@@ -271,7 +313,7 @@ class SSLContext {
             }
             _raise_if_handshake_failed(rc, vr)
         }
-        return SSLSocket(conn, sock, server_hostname)
+        return SSLSocket(own conn, sock, server_hostname)
     }
 }
 

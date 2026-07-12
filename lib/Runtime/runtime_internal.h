@@ -149,14 +149,24 @@ enum DragonValueTag : int8_t {
 };
 
 // A container element's value-tag is "traceable" iff it points at a heap object
-// the cycle collector must follow to find cycles: list, dict, or bytes. Class
-// instances / sets / tuples stored as elements are stamped TAG_LIST=5 by codegen;
-// str=1 and the scalar tags 0/2/3/4 are leaves the collector never follows.
+// the cycle collector must follow to find cycles: list, dict, bytes, or a
+// Callable slot (DRAGON_TAG_CLOSURE = 10). A Callable element may be a real
+// DragonClosure whose env can point back at the container (a genuine cycle,
+// leaks.md #11) or a bare fn pointer with no header; including tag 10 here is
+// safe because the traverse visit fns only dereference children found in the
+// tracked set, so a bare fn ptr is a hash-miss no-op. Class instances / sets /
+// tuples stored as elements are stamped TAG_LIST=5 by codegen; str=1 and the
+// scalar tags 0/2/3/4 are leaves the collector never follows.
 // SINGLE SOURCE OF TRUTH shared by the container traverse functions AND the
-// acyclic-skip allocation/insert gate, so the two cannot diverge - a gate that
+// acyclic-skip allocation/insert gates, so the two cannot diverge - a gate that
 // skipped tracking something the traverse follows would leak a live cycle.
+// (That divergence was real: AUDIT-2026-07-09 Tier 4 - the traverse fns grew
+// explicit closure arms while the dict/tuple insert gates kept using this
+// predicate without tag 10, so a dict/tuple whose only heap values were
+// closures was never enrolled and closure cycles through them never collected.)
 static inline bool dragon_value_tag_is_traceable(int8_t tag) {
-    return tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES;
+    return tag == TAG_LIST || tag == TAG_DICT || tag == TAG_BYTES ||
+           tag == (int8_t)DRAGON_TAG_CLOSURE;
 }
 
 //===----------------------------------------------------------------------===//
@@ -798,11 +808,28 @@ static inline DragonString* dragon_string_from_data(const char* data) {
     return (DragonString*)((char*)data - offsetof(DragonString, data));
 }
 
+// Linker-provided bounds of the executable image (GNU ld default script;
+// correct under PIE after relocation). Used to range-gate the heap-string
+// probe below.
+extern char __executable_start[];
+extern char _end[];
+
 /// Heap-vs-literal check for a `const char*` string pointer. Borrowed C
 /// literals don't have a DragonObjectHeader; heap DragonStrings do, with
 /// `type_tag == DRAGON_TAG_STR` and the GC_FLAG_HEAP_OBJ bit set.
+///
+/// The image range check MUST come before the header probe. A literal lives
+/// in the binary's rodata, and probing the bytes BEFORE it is unsound: an
+/// unlucky neighboring symbol can fake a valid header purely by layout
+/// coincidence (A/B-proven 2026-07-11: an unrelated runtime edit shifted
+/// rodata so one ssl.dr literal's neighbor matched tag+flags, and the next
+/// exception-slot decref WROTE a refcount into the read-only page - SEGV in
+/// test_ssl_roundtrip). Heap allocations can never live inside the image, so
+/// the two compares are both sufficient and cheaper than the header loads
+/// they replace on the literal path
 static inline int dragon_str_is_heap(const char* s) {
     if (!s) return 0;
+    if (s >= (const char*)__executable_start && s < (const char*)_end) return 0;
     DragonString* ds = dragon_string_from_data(s);
     return ds->header.type_tag == DRAGON_TAG_STR &&
            (ds->header.gc_flags & GC_FLAG_HEAP_OBJ) ? 1 : 0;
@@ -992,6 +1019,12 @@ void dragon_list_sort(DragonList* list);
 void dragon_list_sort_ex(DragonList* list, int64_t reverse);
 void dragon_list_reverse(DragonList* list);
 DragonList* dragon_list_copy(DragonList* list);
+// dub (docs/002 2.7): spine copy + per-element deep copy by tag; every
+// element arrives +1 (fresh container or identity-retained immutable).
+DragonList* dragon_list_deep_copy(DragonList* list);
+DragonDict* dragon_dict_deep_copy(DragonDict* d);
+int64_t dragon_deep_copy_tagged(int64_t val, int64_t tag);
+void* dragon_obj_retain(void* p);
 DragonList* dragon_list_repeat(DragonList* src, int64_t count);
 // list + list → fresh list (copy lhs, extend with rhs). Box-aware: dispatches
 // to dragon_list_box_concat when either operand is a list[Any] (DragonListBox).

@@ -722,12 +722,37 @@ void CodeGen::visit(AssignStmt& node) {
                                 else if (fieldKind != Impl::VarKind::Other)
                                     newKind = fieldKind;
                                 bool rhsBorrowed = Impl::isBorrowedHeapExpr(node.value.get());
+                                // An Any/Union field slot is a {tag, payload} box
+                                // VALUE. A NATIVE RHS (`k.v = "d" + s`, `k.v = 5`)
+                                // must be boxed here: the raw store wrote the
+                                // native value over the box's TAG half - reads saw
+                                // pointer bits as the tag (isinstance silently
+                                // false), the stored heap value leaked (nothing
+                                // could ever read or release it), and dealloc
+                                // tag-dispatched on garbage (test_rc_any_field.dr).
+                                // boxArgTagPayload settles ownership Model-B style
+                                // (increfs a borrowed source; an owned temp's +1
+                                // transfers to the box), so the slot store must
+                                // not incref again.
+                                if (fieldKind == Impl::VarKind::Union &&
+                                    storeVal->getType() != impl_->boxType) {
+                                    auto tp = impl_->boxArgTagPayload(
+                                        node.value.get(), storeVal,
+                                        /*takesOwnership=*/true);
+                                    storeVal = impl_->makeBox(tp.first, tp.second);
+                                    rhsBorrowed = false;
+                                }
                                 // A heap value stored into a SHARED instance's field becomes
                                 // globally reachable - mark it (inline-gated on the object's SHARED bit).
                                 impl_->emitFieldSharedBarrier(objPtr, storeVal, fieldKind);
                                 impl_->storeWithRCOverwrite(
                                     gep, fieldType, storeVal, fieldKind, newKind, rhsBorrowed,
                                     className + "." + attrTarget->attribute);
+                                // `self._f = own x`: the field adopted the +1
+                                // (rhsBorrowed=false via isBorrowedHeapExpr's
+                                // move exception); null the source so scope
+                                // exit sees nothing (docs/002 2.4 row 3).
+                                impl_->emitMoveOutIfMarked(node.value.get());
                             }
                             continue;
                         }
@@ -1477,7 +1502,26 @@ void CodeGen::visit(AssignStmt& node) {
             // then dispatches on garbage tag bits and decrefs random
             // pointers.
             bool didUnboxToNative = false;
+            // An OWNED box result (dragon_box_subscript on an `Any` value) unboxed
+            // into a native slot carries a +1 on its payload that the store below
+            // neither adopts nor releases - it increfs for the slot's own ref, or
+            // (a fresh Other-kind slot) does nothing - so the box's +1 is orphaned
+            // (one leaked payload per `x: str = anyVal[k]`). Capture the payload +
+            // tag from the box BEFORE it is unboxed, and release that +1 after the
+            // store. Gated on isOwnedBoxResult: a BORROWED element read
+            // (dict_get_box / dict_int_get_box / list_box_get, e.g. the hot-path
+            // `const s: str = typedDict[k]` over a parsed dict[str,Any]) carries NO
+            // +1, so it is left alone - releasing it would double-free.
+            bool ownedBoxUnboxed = false;
+            llvm::Value* ownedBoxPayload = nullptr;
+            llvm::Value* ownedBoxTag = nullptr;
             if (val->getType() == impl_->boxType && allocType != impl_->boxType) {
+                if (impl_->options.gcMode == GCMode::RC &&
+                    impl_->isOwnedBoxResult(val)) {
+                    ownedBoxUnboxed = true;
+                    ownedBoxPayload = impl_->boxPayloadI64(val, "ownbox.pay");
+                    ownedBoxTag = impl_->boxTag(val, "ownbox.tag");
+                }
                 val = impl_->boxPayloadAsKind(
                     val, Impl::typeKindToVarKind(
                              allocType == impl_->f64Type ? Type::Kind::Float :
@@ -1584,6 +1628,16 @@ void CodeGen::visit(AssignStmt& node) {
                 impl_->storeWithRCOverwrite(
                     alloca, allocType, val, oldKind, newKind, rhsBorrowed, name->name);
             }
+            // Release the OWNED box temporary's +1 (captured above), but ONLY when
+            // the store treated the RHS as borrowed (rhsBorrowed) and took its own
+            // independent ref - then the box's +1 is surplus (the box_subscript-on-
+            // Any case: container owns the payload, box_subscript increfed, the
+            // slot increfed again; drop the box's). A box_binop / Any-returning
+            // call result is a FRESH payload with no other owner (rhsBorrowed=
+            // false, store ADOPTS the box's +1); releasing it would double-free.
+            // Tag-gated: no-op for a non-heap payload.
+            if (ownedBoxUnboxed && rhsBorrowed)
+                impl_->emitUnionDecref(ownedBoxPayload, ownedBoxTag);
 
             // D027: If RHS was a closure (from capturing lambda), track it
             if (impl_->lastClosureCallableType) {
@@ -1684,6 +1738,13 @@ void CodeGen::visit(AssignStmt& node) {
                     // Track Lock() calls
                     if (calleeName->name == "Lock") {
                         impl_->varClassNames[name->name] = "__Lock";
+                        // docs/002 2.10: bare Lock LOCAL - the scope owns it;
+                        // arm the null-gated destroy at scope exit (module
+                        // globals are handled on the module path above and
+                        // are NOT armed - they live for the process).
+                        if (!impl_->scopes.empty())
+                            impl_->scopes.back().lockDestroyOnExit.insert(
+                                name->name);
                     }
                     if (calleeName->name == "SyncList") {
                         impl_->varClassNames[name->name] = "__SyncList";

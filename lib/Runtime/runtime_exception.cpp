@@ -154,12 +154,66 @@ const char* dragon_exc_bind_msg(void) {
     return m;
 }
 
+//===----------------------------------------------------------------------===//
+// Exception-instance ownership (mirrors the exc_msg block above)
+//
+// The exc_obj slot OWNS the +1 the raise site transfers into it. Every
+// overwrite releases the previous instance; a matching `except X as e`
+// handler binds via dragon_exc_bind_obj (its OWN +1, released by the
+// handler's scope / unwind cleanup), and the slot's ref is released by the
+// NEXT raise's overwrite (or by dragon_vthread_log_uncaught). At most one
+// caught instance is retained per exception context between raises - a
+// bounded root, not growth. Before this, the slot was a bare pointer store
+// with an implicit "the handler will take it" contract that only the bound
+// user-class handler shape fulfilled: `except AppError { }` (no `as`) and
+// builtin-typed handlers leaked the instance and its fields on every raise,
+// and a second raise overwrote the slot without releasing the first
+// (AUDIT-2026-07-09 1.5, test_rc_exc_instance.dr)
+//===----------------------------------------------------------------------===//
+
+static void dragon_exc_obj_set(void* obj, int consume) {
+    void** slot = EXC_VT ? &EXC_VT->exc_obj : &__dragon_exc_obj;
+    void* old = *slot;
+    if (old == obj) {
+        // Re-raise of the in-flight instance: the slot already owns it. A
+        // consume transfer hands us a SECOND +1 - fold it into the slot's.
+        if (consume && obj) dragon_decref(obj);
+        return;
+    }
+    if (!consume && obj) dragon_incref(obj);
+    *slot = obj;
+    if (old) dragon_decref(old);
+}
+
+/// Bind the in-flight instance for an `except X as e` handler local. The
+/// binding takes its OWN +1 so a nested raise inside the handler - which
+/// overwrites and releases the slot - cannot leave `e` dangling. The
+/// handler's scope / unwind cleanup decrefs the binding. NULL-safe
+void* dragon_exc_bind_obj(void) {
+    void* o = EXC_VT ? EXC_VT->exc_obj : __dragon_exc_obj;
+    dragon_incref(o);
+    return o;
+}
+
+/// NULL-safe retain for an instance a deferred re-raise saved BEFORE running
+/// a finally body: the consume re-raise transfers this hold back into the
+/// slot (mirrors dragon_exc_bind_msg's retain-at-save discipline).
+void* dragon_exc_retain_obj(void* o) {
+    dragon_incref(o);
+    return o;
+}
+
 static void dragon_raise_exc_impl(int64_t type, void* obj, const char* msg,
                                   int consume) {
     dragon_exc_msg_set(msg, consume);
+    // The obj is ALWAYS a +1 transfer into the slot (fresh construction,
+    // retained saves) or NULL. Borrowed-instance raise sites (raise of a
+    // bound local, the with-statement re-raise) retain first via
+    // dragon_exc_retain_obj, turning themselves into transfers; the
+    // same-pointer fold in dragon_exc_obj_set keeps re-raises balanced.
+    dragon_exc_obj_set(obj, /*consume=*/1);
     if (EXC_VT) {
         EXC_VT->exc_type = (int)type;
-        EXC_VT->exc_obj = obj;
         if (EXC_VT->exc_sp >= 0) {
             int sp = EXC_VT->exc_sp;
             longjmp(EXC_VT->exc_stack[sp], (int)type);
@@ -169,7 +223,6 @@ static void dragon_raise_exc_impl(int64_t type, void* obj, const char* msg,
         exit(1);
     }
     __dragon_exc_type = (int)type;
-    __dragon_exc_obj = obj;
     if (__dragon_exc_sp >= 0) {
         int sp = __dragon_exc_sp;
         longjmp(__dragon_exc_stack[sp], (int)type);
@@ -201,18 +254,20 @@ void dragon_raise_exc_cstr(int64_t type, const char* msg) {
 }
 
 /// Raise a typed-field exception with an attached user-class instance.
-/// `obj` is the constructed instance (refcount+1 at the raise site); the
-/// exception machinery treats it as borrowed for the duration of unwinding,
-/// and the matching `except ... as e` handler takes the +1 onto `e` so the
-/// instance is decref'd by the handler's scope cleanup. `msg` is the best-
-/// effort string rendering (e.g. the user's reason field) so handlers that
-/// only read the message string still work.
+/// `obj` TRANSFERS a +1 into the owning exc_obj slot (a fresh construction's
+/// ref, or an explicit dragon_exc_retain_obj hold for borrowed-instance and
+/// slot re-raise sites; the same-pointer fold keeps re-raises balanced).
+/// A matching `except X as e` handler binds via dragon_exc_bind_obj (its own
+/// +1); the slot's ref is released by the next overwrite or the uncaught
+/// path. `msg` is the best-effort string rendering (e.g. the user's reason
+/// field) so handlers that only read the message string still work.
 void dragon_raise_exc_obj(int64_t type, void* obj, const char* msg) {
     dragon_raise_exc_impl(type, obj, msg, 0);
 }
 
 /// Obj-raise consuming an owned +1 message - used by the deferred re-raise
-/// after `finally`, whose saved message was retained at record time.
+/// after `finally`, whose saved message AND instance were retained at record
+/// time (both holds transfer back into the slots here).
 void dragon_raise_exc_obj_consume(int64_t type, void* obj, const char* msg) {
     dragon_raise_exc_impl(type, obj, msg, 1);
 }
@@ -300,18 +355,18 @@ void dragon_exc_cleanup_unwind(void) {
     int32_t target = saved[sp_exc];
     if (target < 0) target = 0;
 
-    // The raised instance is borrowed during unwinding: the matching
-    // `except X as e` handler takes the instance's +1. Freeing it here would
-    // double-free, so skip any entry aliasing it (`raise <local instance>`).
-    // The message needs NO such skip anymore: the exc_msg slot owns its own
-    // dup/transfer (dragon_exc_msg_set), never an alias of a scope local -
-    // so a local raised as a message is correctly freed right here.
-    void* keep_obj = EXC_VT ? EXC_VT->exc_obj : __dragon_exc_obj;
+    // The exc_obj slot now OWNS its own +1 (dragon_exc_obj_set: raise sites
+    // transfer a fresh construction or an explicit dragon_exc_retain_obj
+    // hold), exactly like exc_msg - never an alias of a scope local's ref.
+    // So a local aliasing the in-flight instance is correctly freed right
+    // here. The historical `keep_obj` skip protected the old borrowed-slot
+    // contract; under the owning contract it inverted into a leak: every
+    // `raise <local instance>` unwinding through its frame kept one ref
+    // alive per raise (unbounded in a retry loop).
 
     while (cs->sp > target) {
         int32_t i = --cs->sp;
         void* p = (void*)(uintptr_t)cs->vals[i];
-        if (p == keep_obj) continue;
         switch (cs->kinds[i]) {
             case DCLEAN_STR:      dragon_decref_str((const char*)p); break;
             case DCLEAN_CALLABLE: dragon_decref_callable(p); break;

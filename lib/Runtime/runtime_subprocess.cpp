@@ -32,6 +32,32 @@
   #include <pthread.h>
 #endif
 
+#ifndef _WIN32
+// Create a pipe with both ends CLOEXEC. The runtime is multithreaded (scheduler
+// workers + reactor), so a CONCURRENT dragon_subprocess_spawn on another carrier
+// thread can fork between our pipe() and exec and inherit our pipe ends into an
+// unrelated child - that child then holds our stdout write end open, so our
+// drain never sees EOF and communicate() hangs past the intended child's death
+// (AUDIT-2026-07-09 2.5). O_CLOEXEC closes that race: the child of THIS spawn
+// re-establishes the ends it needs via dup2 (which clears CLOEXEC on the copy),
+// so the existing child-side wiring is unaffected. pipe2 in one syscall where
+// available; fcntl fallback otherwise
+static int make_pipe_cloexec(int fds[2]) {
+#if defined(__linux__) || defined(__FreeBSD__)
+    return pipe2(fds, O_CLOEXEC);
+#else
+    if (pipe(fds) != 0) return -1;
+    for (int i = 0; i < 2; ++i) {
+        int fl = fcntl(fds[i], F_GETFD);
+        if (fl == -1 || fcntl(fds[i], F_SETFD, fl | FD_CLOEXEC) == -1) {
+            int e = errno; close(fds[0]); close(fds[1]); errno = e; return -1;
+        }
+    }
+    return 0;
+#endif
+}
+#endif
+
 extern "C" {
 
 // Forward decls for the green-thread cooperation seam (runtime_concurrency.cpp).
@@ -69,19 +95,19 @@ DragonList* dragon_subprocess_spawn(DragonList* argv, int cap_in, int cap_out,
     int out_pipe[2] = {-1, -1};
     int err_pipe[2] = {-1, -1};
 
-    if (cap_in && pipe(in_pipe) != 0) {
+    if (cap_in && make_pipe_cloexec(in_pipe) != 0) {
         dragon_list_append(result, -1); dragon_list_append(result, errno);
         dragon_list_append(result, -1); dragon_list_append(result, -1);
         return result;
     }
-    if (cap_out && pipe(out_pipe) != 0) {
+    if (cap_out && make_pipe_cloexec(out_pipe) != 0) {
         int e = errno;
         if (cap_in) { close(in_pipe[0]); close(in_pipe[1]); }
         dragon_list_append(result, -1); dragon_list_append(result, e);
         dragon_list_append(result, -1); dragon_list_append(result, -1);
         return result;
     }
-    if (cap_err && pipe(err_pipe) != 0) {
+    if (cap_err && make_pipe_cloexec(err_pipe) != 0) {
         int e = errno;
         if (cap_in)  { close(in_pipe[0]);  close(in_pipe[1]); }
         if (cap_out) { close(out_pipe[0]); close(out_pipe[1]); }

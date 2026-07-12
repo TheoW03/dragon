@@ -380,6 +380,11 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // %dragon.box dragon_list_box_get(ptr list, i64 index)
     getOrDeclareRuntime("dragon_list_box_get",
         llvm::FunctionType::get(boxType, {i8PtrType, i64Type}, false));
+    // void dragon_list_view_check(ptr list, i64 want_elem_tag) - raises
+    // TypeError when a box-tagged list payload's representation (DragonList
+    // vs DragonListBox, elem_tag) doesn't match the typed view unboxing it.
+    getOrDeclareRuntime("dragon_list_view_check",
+        llvm::FunctionType::get(voidType, {i8PtrType, i64Type}, false));
     // void dragon_list_box_set(ptr list, i64 index, i64 tag, i64 payload)
     getOrDeclareRuntime("dragon_list_box_set",
         llvm::FunctionType::get(voidType, {i8PtrType, i64Type, i64Type, i64Type}, false));
@@ -765,6 +770,13 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // ptr dragon_exc_bind_msg() - `except ... as e` binding with its own +1.
     getOrDeclareRuntime("dragon_exc_bind_msg",
         llvm::FunctionType::get(i8PtrType, {}, false));
+    // ptr dragon_exc_bind_obj() - instance binding with its own +1 (NULL-safe).
+    getOrDeclareRuntime("dragon_exc_bind_obj",
+        llvm::FunctionType::get(i8PtrType, {}, false));
+    // ptr dragon_exc_retain_obj(ptr) - NULL-safe retain for deferred re-raise
+    // saves and borrowed-instance raises (the consume raise transfers it back).
+    getOrDeclareRuntime("dragon_exc_retain_obj",
+        llvm::FunctionType::get(i8PtrType, {i8PtrType}, false));
     // --- Unwind cleanup stack (frees owned heap locals a longjmp skips) ---
     auto* i32Ty = llvm::Type::getInt32Ty(*context);
     // i32 dragon_cleanup_push(i64 val, i32 kind, i32 tag)
@@ -1060,6 +1072,16 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // void dragon_lock_destroy(ptr lock)
     getOrDeclareRuntime("dragon_lock_destroy",
         llvm::FunctionType::get(voidType, {i8PtrType}, false));
+    // del debug tripwire (docs/002 ADR): assert the proven-sole-owner
+    // refcount is exactly 1 at the del site. -O0 builds only.
+    // void dragon_del_assert_unique(ptr p, i64 cls, ptr file, i64 line)
+    getOrDeclareRuntime("dragon_del_assert_unique",
+        llvm::FunctionType::get(voidType,
+            {i8PtrType, i64Type, i8PtrType, i64Type}, false));
+    // void dragon_del_assert_unique_box(i64 tag, i64 payload, ptr file, i64 line)
+    getOrDeclareRuntime("dragon_del_assert_unique_box",
+        llvm::FunctionType::get(voidType,
+            {i64Type, i64Type, i8PtrType, i64Type}, false));
     // --- SyncList functions ---
     getOrDeclareRuntime("dragon_synclist_new",
         llvm::FunctionType::get(i8PtrType, {}, false));
@@ -1358,12 +1380,30 @@ void CodeGen::Impl::forwardDeclareFunctions(dragon::Module& mod) {
             if (module->getFunction(llvmName)) {
                 // The LLVM symbol already exists (another module declared an
                 // extern with the same C symbol - e.g. glob.dr/path.dr both
-                // declare `getcwd`). The dedup must NOT skip this module's
+                // declare `getcwd` - or declareRuntimeFunctions pre-declared a
+                // dragon_* symbol). The dedup must NOT skip this module's
                 // Dragon-side alias registration (Gap #12): without it, a call
                 // to the alias (e.g. os's `_libc_getcwd`) resolves to nothing.
-                // Register the alias, then skip only the symbol re-creation.
+                // It must not skip the RC side maps either: every `dragon_*`
+                // extern collides with the runtime pre-declarations, so its
+                // param kinds and FFI drain eligibility were never registered
+                // and owned arg temps at those call sites never drained
+                // (stdlib http's nested dragon_str_concat, AUDIT 1.2).
                 if (func->isExtern && !func->externSymbol.empty())
                     importedFuncAliasesByModule[currentModuleName][func->name] = llvmName;
+                if (options.gcMode == GCMode::RC && func->isExtern) {
+                    if (!funcParamKinds.count(llvmName)) {
+                        std::vector<VarKind> pkinds;
+                        for (auto& p : func->params)
+                            pkinds.push_back(typeExprToKind(p.type.get()));
+                        funcParamKinds[llvmName] = std::move(pkinds);
+                    }
+                    externFuncNames.insert(llvmName);
+                    bool ptrReturn = false;
+                    if (auto* rn = dynamic_cast<NamedTypeExpr*>(func->returnType.get()))
+                        ptrReturn = (rn->name == "ptr");
+                    if (!ptrReturn) externDrainableFuncs.insert(llvmName);
+                }
                 continue; // already declared
             }
             std::vector<llvm::Type*> paramTypes;
@@ -1460,12 +1500,24 @@ void CodeGen::Impl::forwardDeclareFunctions(dragon::Module& mod) {
             // no tag-arg companion.
             if (options.gcMode == GCMode::RC) {
                 std::vector<VarKind> pkinds;
-                for (auto& p : func->params)
+                std::vector<bool> powns;
+                for (auto& p : func->params) {
                     pkinds.push_back(typeExprToKind(p.type.get()));
+                    powns.push_back(p.isOwn);
+                }
                 funcParamKinds[llvmName] = std::move(pkinds);
-                // Extern "C" callees don't follow the RC borrow convention; the
-                // call site must not release owned-temp args passed to them.
-                if (func->isExtern) externFuncNames.insert(llvmName);
+                funcParamOwns[llvmName] = std::move(powns);
+                // Extern "C" callees follow the FFI v0 ownership contract (see
+                // externDrainableFuncs in CodeGenImpl.h): args borrowed for the
+                // call, managed returns fresh; a `ptr` return may alias an
+                // argument, so only non-ptr-returning externs are drain-eligible.
+                if (func->isExtern) {
+                    externFuncNames.insert(llvmName);
+                    bool ptrReturn = false;
+                    if (auto* rn = dynamic_cast<NamedTypeExpr*>(func->returnType.get()))
+                        ptrReturn = (rn->name == "ptr");
+                    if (!ptrReturn) externDrainableFuncs.insert(llvmName);
+                }
             }
             // Store default parameter values for call-site filling
             {
@@ -1862,14 +1914,18 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                 // bodies and triggering the GC-collect crash at request 87.
                 if (options.gcMode == GCMode::RC) {
                     std::vector<VarKind> mkinds;
+                    std::vector<bool> mowns;
                     if (!methodDecl->isStatic) {
                         // self is a ClassInstance heap arg.
                         mkinds.push_back(VarKind::ClassInstance);
+                        mowns.push_back(false);
                     }
                     for (size_t i = mParamStart; i < methodDecl->params.size(); ++i) {
                         mkinds.push_back(typeExprToKind(methodDecl->params[i].type.get()));
+                        mowns.push_back(methodDecl->params[i].isOwn);
                     }
                     funcParamKinds[methodName] = std::move(mkinds);
+                    funcParamOwns[methodName] = std::move(mowns);
                 }
 
                 // Store default parameter values (indexed by LLVM param position)

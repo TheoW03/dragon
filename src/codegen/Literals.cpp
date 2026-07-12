@@ -49,6 +49,17 @@ void CodeGen::visit(StringLiteral& node) {
             part.expr->accept(*this);
             llvm::Value* exprVal = impl_->lastValue;
 
+            // A str part emitted as-is (no conversion call) is only BORROWED
+            // when its expr/value actually borrow. An owned call result
+            // (`f"{cfg.get('host', '?')}"` - the getter increfs per #19)
+            // already carries the +1 the f-string result hands out; marking
+            // it borrowed made the single-part retain below double-count it,
+            // leaking the dict's stored value once per evaluation.
+            auto partBorrows = [&](llvm::Value* v) {
+                return Impl::isBorrowedHeapExpr(part.expr.get()) ||
+                       !impl_->isOwnedStrResult(v);
+            };
+
             const std::string& formatSpec = part.formatSpec;
             llvm::Value* strVal;
             if (!formatSpec.empty() && exprVal->getType() == impl_->f64Type) {
@@ -103,12 +114,12 @@ void CodeGen::visit(StringLiteral& node) {
                     impl_->addError("invalid format spec '" + s +
                                     "' for str value", node.location());
                     strVal = exprVal;
-                    lastPartBorrowedStr = true;
+                    lastPartBorrowedStr = partBorrows(exprVal);
                 } else if (!sawWidth) {
                     // alignment with no width is a no-op pad - emit the str as-is.
                     (void)sawAlign;
                     strVal = exprVal;
-                    lastPartBorrowedStr = true;
+                    lastPartBorrowedStr = partBorrows(exprVal);
                 } else {
                     std::string rt = align == '>' ? "dragon_str_rjust"
                                    : align == '^' ? "dragon_str_center"
@@ -145,7 +156,7 @@ void CodeGen::visit(StringLiteral& node) {
                         impl_->runtimeFuncs[creprFn], {exprVal}, "ctos");
                 } else {
                     strVal = exprVal;
-                    lastPartBorrowedStr = true;
+                    lastPartBorrowedStr = partBorrows(exprVal);
                 }
             } else if (exprVal->getType() == impl_->i1Type) {
                 llvm::Value* ext = impl_->builder->CreateZExt(exprVal, impl_->i64Type);

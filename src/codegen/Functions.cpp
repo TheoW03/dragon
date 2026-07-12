@@ -1267,9 +1267,20 @@ void CodeGen::visit(FunctionDecl& node) {
                     impl_->varClassNames[paramName] = named->name;
             }
         }
-        // GC: mark params as borrowed - caller owns the reference
-        if (Impl::isHeapKind(paramKind))
+        // GC: mark params as borrowed - caller owns the reference. An `own`
+        // param is the exception (docs/002 2.8): the caller MOVED its +1 in,
+        // so this callee owns it and scope exit releases it (unless the body
+        // consumed it onward, which nulls the slot).
+        if (Impl::isHeapKind(paramKind) && !node.params[astIdx].isOwn)
             impl_->scopes.back().borrowed.insert(paramName);
+        // An own Lock param: the callee owns the mutex - arm the null-gated
+        // scope-exit destroy exactly like a bare Lock local.
+        if (node.params[astIdx].isOwn && node.params[astIdx].type) {
+            if (auto* nt = dynamic_cast<NamedTypeExpr*>(
+                    node.params[astIdx].type.get()))
+                if (nt->name == "Lock")
+                    impl_->scopes.back().lockDestroyOnExit.insert(paramName);
+        }
         astIdx++;
         llvmIdx++;
     }

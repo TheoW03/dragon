@@ -30,7 +30,7 @@ extern "C" def dragon_str_contains(a: str, b: str) -> int
 extern "C" def dragon_str_find(haystack: str, needle: str) -> int
 extern "C" def dragon_str_strip(s: str) -> str
 extern "C" def dragon_str_lower(s: str) -> str
-extern "C" def dragon_str_join(sep: str, parts: list) -> str
+extern "C" def dragon_str_join(sep: str, parts: list[str]) -> str
 extern "C" def dragon_ord(s: str) -> int
 extern "C" def dragon_str_to_int(s: str) -> int
 extern "C" def dragon_str_to_float(s: str) -> float

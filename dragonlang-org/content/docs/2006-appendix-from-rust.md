@@ -11,10 +11,11 @@ reference counter plus a cycle collector - and spends real engineering
 effort driving that cost toward zero.
 
 If you come from Rust, the single most important sentence in this
-appendix is this: **there is no borrow checker, no lifetimes, and no
-move semantics.** You will not annotate `'a`. You will not fight `&mut`.
-You will not call `.clone()` to placate the compiler. That entire layer
-of the Rust mental model simply does not exist here. What you give up for
+appendix is this: **there is no borrow checker and there are no
+lifetimes.** You will not annotate `'a`. You will not fight `&mut`. Move
+semantics exist, but they are opt-in and local: sharing is the default,
+and a value moves only where you wrote `own` - there is no whole-program
+ownership proof to satisfy. What you give up for
 it is Rust's *guarantee* of zero-overhead, data-race-free memory - Dragon
 competes with Rust on speed, but reaches it through a managed runtime
 rather than a compile-time proof, and it does not match Rust's
@@ -33,8 +34,8 @@ the type system by hand.
 Dragon takes the CPython road instead: every heap object
 carries a reference count, and a supplementary tracing collector reclaims
 reference cycles that pure counting would leak. You never write a
-lifetime, never move a value to satisfy the compiler, never reach for
-`Rc<RefCell<T>>` to share something mutably. Sharing is the default and
+lifetime and never reach for `Rc<RefCell<T>>` to share something mutably;
+values move only where you wrote `own`. Sharing is the default and
 costs you nothing at the keyboard.
 
 ```rust
@@ -66,12 +67,32 @@ collector traffic is a cost it engineers down, not a gap it concedes.
 
 | Topic | Rust | Dragon |
 |-------|------|--------|
-| Reclamation | Ownership + drop at scope end | Refcount + cycle collector |
+| Reclamation | Ownership + drop at scope end | Refcount + cycle collector; `own` fields and `del` add deterministic early release |
 | Lifetimes | Explicit `'a` annotations | None |
-| Move semantics | Values move by default | No moves - values are shared |
-| Shared mutability | `Rc<RefCell<T>>`, `Arc<Mutex<T>>` | Just share the reference |
-| Aliasing rules | Enforced by borrow checker | Unrestricted |
+| Move semantics | Values move by default | Opt-in: `own` at both the signature and the call site |
+| Shared mutability | `Rc<RefCell<T>>`, `Arc<Mutex<T>>` | Just share the reference (an `own Lock` field guards cross-thread mutation) |
+| Aliasing rules | Enforced by borrow checker | Unrestricted by default; `del`/`own` demand a sole-owner proof exactly where used |
 | Runtime cost | Zero (no GC) | RC traffic + occasional collection |
+
+### The ownership keywords, mapped
+
+Dragon's three ownership keywords are the Rust ideas you know, made opt-in
+and kept local to the lines that use them:
+
+| Rust | Dragon | Difference |
+|------|--------|------------|
+| move (default, everywhere) | `own` (both ends: `def f(own d: T)` / `f(own d)`) | opt-in; use-after-move is a compile error in both |
+| `.clone()` | `dub` | explicit and priced in both; `dub` is the *only* second-owner path |
+| `drop(x)` | `del x` | `del` compiles only with a static sole-owner proof; refusal names the alias |
+| `impl Drop` | `own` fields | release is generated; no user code runs at death |
+| drop flags | forbidden | a conditional move must be closed with `del` on every path |
+| `Send`/`Sync` | the `fire` boundary | values cross a green thread by `own`, `dub`, immortality, or a locked type |
+
+Mandatory in exactly three places (a raw-resource field must be `own`, a
+conditional move must be closed with `del`, a mutated iterable must be
+`dub`bed); everywhere else the keywords are optional because the reference
+counter keeps unannotated code correct. See
+[Ownership](/docs/1604-ownership).
 
 ## Errors: exceptions, not `Result<T, E>`
 
