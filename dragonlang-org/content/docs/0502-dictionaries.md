@@ -137,6 +137,36 @@ probe (integer keys hash and compare as native `i64`, never boxed), so lookups
 are as fast as the data allows. A `dict[int, V]` works exactly like the `dict[str,
 V]` shown here - same methods, same iteration - just with integer keys.
 
+## Objects as values
+
+The value type can be one of your own classes, which makes a dict the natural
+registry: sessions by id, handlers by route, compiled schemas by name. Store,
+read at the declared type, and call methods on what comes out:
+
+```dragon
+class Counter {
+    n: int
+    def(n: int) {
+        self.n = n
+    }
+    def bump() -> int {
+        self.n = self.n + 1
+        return self.n
+    }
+}
+
+counters: dict[str, Counter] = {}
+counters["hits"] = Counter(0)
+const c: Counter = counters["hits"]
+print(c.bump())              # 1
+print(counters["hits"].n)    # 1 - same object, not a copy
+```
+
+The dict holds a reference, so everyone reading `"hits"` sees the same
+`Counter`. One boundary to know: class instances have no JSON form, so
+`json.dumps` on a dict holding them raises a `TypeError` - serialize the
+fields you mean to expose instead.
+
 ## Comprehensions
 
 A dict comprehension builds a mapping in one expression:

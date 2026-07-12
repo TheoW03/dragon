@@ -625,7 +625,14 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
             impl_->lastValue = impl_->callDunder(lenClassName, "__len__", arg);
             return true;
         }
-        if (isDeque) {
+        if (arg->getType() == impl_->boxType) {
+            // A box VALUE wins over every static hint (isinstance narrowing
+            // can stamp the arg's static type `list` while the binding stays
+            // a box): dragon_box_len dispatches on the tag and the payload
+            // header, so either list representation sizes correctly.
+            impl_->lastValue = impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_box_len"], {arg}, "len");
+        } else if (isDeque) {
             impl_->lastValue = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_deque_len"], {arg}, "len");
         } else if (isBytes) {

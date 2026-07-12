@@ -1091,6 +1091,33 @@ struct OwnershipCheck::Impl {
                                           target->location()));
                     return;
                 }
+                // The own-transfer slice (ADR 2.4 target semantics): a bare
+                // name that is a LIVE sole owner - an `own` parameter, or a
+                // fresh-owned local - stored into an own field is an IMPLICIT
+                // move on this use. No explicit `own` is required (matching the
+                // book: `self._data = d` for an own param d). Consume it so a
+                // later use is a use-after-move error; codegen lowers a field
+                // store identically whether or not `own` was written (the move
+                // marker is invisible to it), so this needs no runtime change.
+                // An aliased/escaped owner (OwnedFact) or an actual borrow
+                // (Borrowed) can NOT be moved into a sole-owner field and still
+                // falls to the E8 diagnostic below.
+                if (auto* rn = dynamic_cast<NameExpr*>(value)) {
+                    BindState* bs = stateOf(rn->name, flow);
+                    if (bs && bs->st == St::Owned) {
+                        // Mark the name as a move so codegen adopts its +1 into
+                        // the field (isBorrowedHeapExpr keys off isMoveMarked) -
+                        // identical lowering to an explicit `own x`. Without
+                        // this the store would incref a borrow and the moved-in
+                        // owner would leak.
+                        rn->isMoveMarked = true;
+                        consumeBinding(rn, flow, /*isDel=*/false,
+                                       atLine("own field '" + at->attribute +
+                                                  "'",
+                                              target->location()));
+                        return;
+                    }
+                }
                 if (value && typeIsHeap(value->type.get()) &&
                     classifyRhs(value).st != St::Owned) {
                     error(target->location(),

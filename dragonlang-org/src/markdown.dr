@@ -33,6 +33,41 @@ def _html_escape(s: str) -> str {
 }
 
 
+# GitHub-style heading slug: lowercase, alphanumerics kept, every run of other
+# characters (spaces, punctuation, markdown markers like `*`/backticks) becomes
+# a single hyphen, leading/trailing hyphens trimmed. Applied to the RAW heading
+# text so `## json` -> "json" and `### Validating with JSON Schema` ->
+# "validating-with-json-schema". This MUST stay byte-for-byte identical to the
+# copy in controllers/docs/docs.dr so a sidebar anchor href matches the
+# rendered heading's id. Any change here must be mirrored there.
+def slug(text: str) -> str {
+    parts: list[str] = []
+    prev_dash: bool = True   # leading dashes suppressed
+    i: int = 0
+    while i < len(text) {
+        const c: int = ord(text[i])
+        if (c >= 97 and c <= 122) or (c >= 48 and c <= 57) {
+            parts.append(text[i])
+            prev_dash = False
+        } elif c >= 65 and c <= 90 {
+            parts.append(chr(c + 32))   # lowercase A-Z
+            prev_dash = False
+        } else {
+            if not prev_dash {
+                parts.append("-")
+                prev_dash = True
+            }
+        }
+        i = i + 1
+    }
+    out: str = "".join(parts)
+    while len(out) > 0 and out.endswith("-") {
+        out = out[:len(out) - 1]
+    }
+    return out
+}
+
+
 def _starts_with(s: str, prefix: str) -> bool {
     if len(prefix) > len(s) {
         return false
@@ -433,28 +468,33 @@ def render(md: str) -> str {
             continue
         }
 
-        # Headings: # … ######
+        # Headings: # … ######. Each carries an id slug so in-page anchors
+        # (#json) resolve and the sidebar's per-page sub-nav can link to them.
         if _starts_with(stripped, "# ") {
             close_para(); close_lists()
-            out = out + "<h1>" + _render_inline(stripped[2:]) + "</h1>\n"
+            const t: str = stripped[2:]
+            out = out + "<h1 id=\"" + slug(t) + "\">" + _render_inline(t) + "</h1>\n"
             i = i + 1
             continue
         }
         if _starts_with(stripped, "## ") {
             close_para(); close_lists()
-            out = out + "<h2>" + _render_inline(stripped[3:]) + "</h2>\n"
+            const t: str = stripped[3:]
+            out = out + "<h2 id=\"" + slug(t) + "\">" + _render_inline(t) + "</h2>\n"
             i = i + 1
             continue
         }
         if _starts_with(stripped, "### ") {
             close_para(); close_lists()
-            out = out + "<h3>" + _render_inline(stripped[4:]) + "</h3>\n"
+            const t: str = stripped[4:]
+            out = out + "<h3 id=\"" + slug(t) + "\">" + _render_inline(t) + "</h3>\n"
             i = i + 1
             continue
         }
         if _starts_with(stripped, "#### ") {
             close_para(); close_lists()
-            out = out + "<h4>" + _render_inline(stripped[5:]) + "</h4>\n"
+            const t: str = stripped[5:]
+            out = out + "<h4 id=\"" + slug(t) + "\">" + _render_inline(t) + "</h4>\n"
             i = i + 1
             continue
         }

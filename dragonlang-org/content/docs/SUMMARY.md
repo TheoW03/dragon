@@ -123,7 +123,6 @@
 - [Building a Concurrent Application](1702-concurrent-application.md)
 - [Command-Line Tools](1703-command-line-tools.md)
 - [A Real Project: The Dragon Docs Site](1704-real-project.md)
-- [Interactive Islands](1705-interactive-islands.md)
 
 # Desktop Applications
 

@@ -228,7 +228,24 @@ void CodeGen::visit(IfStmt& node) {
         else if (typeName->name == "bool")  nk = Impl::VarKind::Bool;
         else if (typeName->name == "str")   nk = Impl::VarKind::Str;
         else if (typeName->name == "bytes") nk = Impl::VarKind::List;  // D030 §5: bytes/list share generic-heap dispatch
-        else if (typeName->name == "list")  nk = Impl::VarKind::List;
+        else if (typeName->name == "list") {
+            // Narrowing a DECLARED union to its concrete list member keeps
+            // the native-list rebind - the member type fixes the layout. A
+            // bare Any gives no layout guarantee (a tag-5 payload may be a
+            // monomorphized DragonList or a DragonListBox), so KEEP THE BOX
+            // binding: len / subscript / iteration on it runtime-dispatch on
+            // the payload header instead of walking the wrong stride. An Any
+            // param also registers a unionMemberKinds entry, so the gate is
+            // "the declared members INCLUDE a list", not mere presence.
+            auto membIt = impl_->unionMemberKinds.find(argName->name);
+            bool declaredListMember =
+                membIt != impl_->unionMemberKinds.end() &&
+                std::find(membIt->second.begin(), membIt->second.end(),
+                          Impl::VarKind::List) != membIt->second.end();
+            if (!declaredListMember)
+                return {"", Impl::VarKind::Other};
+            nk = Impl::VarKind::List;
+        }
         else if (typeName->name == "dict")  nk = Impl::VarKind::Dict;
         else if (typeName->name == "tuple") nk = Impl::VarKind::Tuple;
         else if (typeName->name == "set")   nk = Impl::VarKind::Set;

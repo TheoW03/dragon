@@ -73,12 +73,13 @@
     });
 
     // Sidebar scroll position: preserve it across page navigations so clicking
-    // a link doesn't bounce the sidebar back to the top and force the reader to
-    // scroll back. The sidebar is its own scroll container (overflow-y:auto), so
-    // we stash its scrollTop in sessionStorage on scroll and restore it on load.
-    // Only when there is no saved position (the first docs page this tab visits)
-    // do we fall back to scrolling the active entry into view.
-    var sb = document.querySelector('.sidebar');
+    // a link doesn't bounce the TOC back to the top and force the reader to
+    // scroll back. The scrolling container is the nav list (.sb-list) - the
+    // brand heading and search box are pinned above it and never scroll - so we
+    // stash .sb-list's scrollTop in sessionStorage on scroll and restore it on
+    // load. Only when there is no saved position (the first docs page this tab
+    // visits) do we fall back to scrolling the active entry into view.
+    var sb = document.querySelector('.sb-list') || document.querySelector('.sidebar');
     if (sb) {
         var SKEY = 'dragon-docs-sb-scroll';
         var restored = false;
@@ -128,4 +129,201 @@
             if (badge) badge.style.display = isMatch ? '' : 'none';
         });
     } catch (_) {}
+})();
+
+// Docs search. A single input in the sidebar; the index (titles + every
+// in-page heading, each with an anchor URL and a preview) is fetched once from
+// /docs/search-index.json on first use and filtered entirely client-side, so
+// there is no per-keystroke round-trip. Keyboard: type to filter, Up/Down to
+// move, Enter to open, Esc to clear/close. Degrades to nothing without JS
+// (the input is inert but the server-rendered nav still works).
+(function () {
+    var input = document.getElementById('docsearch');
+    var box = document.getElementById('docsearch-results');
+    if (!input || !box) return;
+
+    var index = null;       // loaded lazily
+    var loading = false;
+    var items = [];         // current result <a> elements
+    var active = -1;        // keyboard-highlighted index
+
+    function ensureIndex(cb) {
+        if (index) { cb(); return; }
+        if (loading) return;
+        loading = true;
+        fetch('/docs/search-index.json')
+            .then(function (r) { return r.json(); })
+            .then(function (data) { index = data || []; loading = false; cb(); })
+            .catch(function () { loading = false; });
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/[&<>"]/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+    }
+
+    // Highlight each query term inside an (already-escaped) string.
+    function mark(text, terms) {
+        var out = escapeHtml(text);
+        terms.forEach(function (t) {
+            if (!t) return;
+            var re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig');
+            out = out.replace(re, '<mark>$1</mark>');
+        });
+        return out;
+    }
+
+    // Score an entry against the query terms. Title hits outweigh body hits;
+    // a title that starts with the query ranks highest. Every term must appear
+    // somewhere (title or body) for the entry to qualify.
+    function score(entry, terms) {
+        var title = (entry.t || '').toLowerCase();
+        var body = (entry.b || '').toLowerCase();
+        var s = 0;
+        for (var i = 0; i < terms.length; i++) {
+            var term = terms[i];
+            var inTitle = title.indexOf(term);
+            var inBody = body.indexOf(term);
+            if (inTitle < 0 && inBody < 0) return -1;   // term missing -> reject
+            if (inTitle === 0) s += 100;
+            else if (inTitle > 0) s += 40;
+            if (inBody >= 0) s += 5;
+        }
+        // A heading result (has a parent page) is a more precise landing spot
+        // than a whole-page result; nudge it up on ties.
+        if (entry.p) s += 3;
+        return s;
+    }
+
+    function render(results, terms) {
+        if (results.length === 0) {
+            box.innerHTML = '<div class="docsearch-empty">No matches</div>';
+            box.hidden = false;
+            items = [];
+            active = -1;
+            return;
+        }
+        var html = '';
+        for (var i = 0; i < results.length; i++) {
+            var e = results[i];
+            var page = e.p ? '<span class="docsearch-page">' + escapeHtml(e.p) + '</span>' : '';
+            var snip = e.b ? '<span class="docsearch-snippet">' + mark(e.b, terms) + '</span>' : '';
+            html += '<a class="docsearch-item" href="' + escapeHtml(e.u) + '">'
+                 +  '<span class="docsearch-title">' + mark(e.t, terms) + page + '</span>'
+                 +  snip + '</a>';
+        }
+        box.innerHTML = html;
+        box.hidden = false;
+        items = Array.prototype.slice.call(box.querySelectorAll('.docsearch-item'));
+        active = -1;
+    }
+
+    function run() {
+        var q = input.value.trim().toLowerCase();
+        if (q.length < 2) { close(); return; }
+        ensureIndex(function () {
+            var terms = q.split(/\s+/).filter(Boolean);
+            var scored = [];
+            for (var i = 0; i < index.length; i++) {
+                var sc = score(index[i], terms);
+                if (sc >= 0) scored.push({ e: index[i], s: sc });
+            }
+            scored.sort(function (a, b) { return b.s - a.s; });
+            render(scored.slice(0, 25).map(function (x) { return x.e; }), terms);
+        });
+    }
+
+    function close() {
+        box.hidden = true;
+        box.innerHTML = '';
+        items = [];
+        active = -1;
+    }
+
+    function setActive(n) {
+        if (active >= 0 && items[active]) items[active].classList.remove('active');
+        active = n;
+        if (active >= 0 && items[active]) {
+            items[active].classList.add('active');
+            items[active].scrollIntoView({ block: 'nearest' });
+        }
+    }
+
+    var debounce;
+    input.addEventListener('input', function () {
+        clearTimeout(debounce);
+        debounce = setTimeout(run, 90);
+    });
+
+    input.addEventListener('keydown', function (ev) {
+        if (box.hidden || items.length === 0) {
+            if (ev.key === 'Escape') { input.value = ''; close(); }
+            return;
+        }
+        if (ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            setActive((active + 1) % items.length);
+        } else if (ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            setActive((active - 1 + items.length) % items.length);
+        } else if (ev.key === 'Enter') {
+            var target = active >= 0 ? items[active] : items[0];
+            if (target) { ev.preventDefault(); window.location.href = target.getAttribute('href'); }
+        } else if (ev.key === 'Escape') {
+            input.value = '';
+            close();
+        }
+    });
+
+    // Close when focus/clicks leave the search box.
+    document.addEventListener('click', function (ev) {
+        if (!input.contains(ev.target) && !box.contains(ev.target)) close();
+    });
+    input.addEventListener('focus', function () { if (input.value.trim().length >= 2) run(); });
+
+    // "/" focuses search from anywhere (unless already typing in a field).
+    document.addEventListener('keydown', function (ev) {
+        if (ev.key === '/' && document.activeElement !== input) {
+            var tag = (document.activeElement && document.activeElement.tagName) || '';
+            if (tag !== 'INPUT' && tag !== 'TEXTAREA') { ev.preventDefault(); input.focus(); }
+        }
+    });
+})();
+
+// Scroll-spy for the active page's in-page sub-nav: highlight the ##/### entry
+// whose section the reader is currently in. Purely visual; the links work
+// without it.
+(function () {
+    var subs = document.querySelectorAll('.sb-subsections a[data-anchor]');
+    if (!subs.length) return;
+    var byAnchor = {};
+    var headings = [];
+    Array.prototype.forEach.call(subs, function (a) {
+        var id = a.getAttribute('data-anchor');
+        byAnchor[id] = a;
+        var h = document.getElementById(id);
+        if (h) headings.push(h);
+    });
+    if (!headings.length) return;
+
+    function spy() {
+        var top = 80;                 // account for the sticky topbar
+        var current = headings[0];
+        for (var i = 0; i < headings.length; i++) {
+            if (headings[i].getBoundingClientRect().top <= top) current = headings[i];
+            else break;
+        }
+        Array.prototype.forEach.call(subs, function (a) { a.classList.remove('sb-sub-active'); });
+        var link = current && byAnchor[current.id];
+        if (link) link.classList.add('sb-sub-active');
+    }
+
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+        if (ticking) return;
+        ticking = true;
+        window.requestAnimationFrame(function () { spy(); ticking = false; });
+    }, { passive: true });
+    spy();
 })();

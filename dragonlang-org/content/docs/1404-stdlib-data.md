@@ -6,7 +6,7 @@ JSON request body, writing a CSV report, packing a binary wire frame,
 encoding a token. This chapter covers the standard-library modules that do
 that work:
 
-- **`json`** - encode and decode JSON.
+- **`json`** - encode, decode, and schema-validate JSON.
 - **`csv`** - split and join comma-separated rows.
 - **`tomllib`** - read TOML configuration (read-only).
 - **`configparser`** - read and write INI files.
@@ -48,7 +48,7 @@ typed local:
 ```dragon
 import json
 
-const obj: dict[str, Any] = json.loads_obj("{\"name\": \"ada\", \"age\": 36}")
+const obj: dict[str, Any] = json.loads_obj('{"name": "ada", "age": 36}')
 const name: str = obj["name"]    # the Any value unboxes into a str here
 const age: int = obj["age"]      # ...and into an int here
 print(name)                      # ada
@@ -62,7 +62,7 @@ it with `isinstance` before binding:
 ```dragon
 import json
 
-const obj: dict[str, Any] = json.loads_obj("{\"port\": 8080}")
+const obj: dict[str, Any] = json.loads_obj('{"port": 8080}')
 const v: Any = obj["port"]
 if isinstance(v, int) {
     const n: int = v
@@ -80,7 +80,7 @@ import json
 
 print(json.loads_int("42"))             # 42
 print(json.loads_float("3.14"))         # 3.14
-print(json.loads_str("\"hello\""))      # hello
+print(json.loads_str('"hello"'))   # hello
 print(json.loads_list_int("[1, 2, 3]")) # [1, 2, 3]
 ```
 
@@ -105,12 +105,120 @@ There are also typed encoders - `dumps_str`, `dumps_int`, `dumps_float`,
 `dumps_bool`, and the `dumps_list_*` family - for when you want to avoid the
 tag dispatch on a hot path.
 
+Values with no JSON form - `bytes` and class instances - raise a catchable
+`TypeError` (`Object of type Thing is not JSON serializable`), exactly as
+CPython's `json.dumps` does.
+
+For building JSON *text* with interpolated values, the module also hosts the
+`JSON` content type: `template[JSON] { {"name": "!{name}"} }` escapes each
+interpolation so it can never break the surrounding document - see
+[HTML, CSS, and XML](/docs/1202-html-css-xml) for the content-type family.
+
+### Validating with JSON Schema
+
+Decoding tells you the payload was *JSON*; it says nothing about whether it
+is the JSON you agreed to accept. The module ships a JSON Schema validator
+(a practical Draft 7 subset) so a service can check a decoded payload
+against its contract before acting on it - no third-party `jsonschema`
+dependency. There is exactly **one entry point**: the `Schema` class. An
+instance names the dialect it speaks and owns a registry of named schemas -
+`register` compiles a schema into the instance immediately, `validate` runs
+by name:
+
+```dragon
+import json
+from json import Schema, ValidationResult, ValidationError
+
+s: Schema = Schema("draft-07")
+s.register("order", {
+    type: "object",
+    required: ["order"],
+    properties: {
+        order: {type: "integer", minimum: 1}
+    }
+})
+
+const good: ValidationResult = s.validate("order", {order: 7})
+print(good.ok)                        # True
+
+const bad: ValidationResult = s.validate("order", json.loads('{"order": 0}'))
+print(bad.ok)                         # False
+const errs: list[ValidationError] = bad.errors
+for e in errs {
+    print(f"{e.path}: {e.message}")   # $.order: value below minimum
+}
+```
+
+Schemas are ordinary Dragon dicts, so the keys are bare identifiers - no
+quoting - and the payload can be anything: a value straight from
+`json.loads`, a dict literal like the `{order: 7}` above, or a native Dragon
+list. `register(name, schema)` also takes a parsed document
+(`s.register("evt", json.loads_obj(text))` for schema text arriving from a
+request body or a database column). `validate(name, payload)` never raises
+on invalid *data* - it returns `ok` plus a list of `ValidationError` values,
+each carrying the JSON `path` of the offending value and a human-readable
+`message`, so one call reports *every* violation instead of stopping at the
+first. The constructor rejects a dialect it does not know (`"draft-07"`,
+`"2019-09"`, `"2020-12"`, and `"latest"` are accepted) with a `ValueError`.
+
+Because the instance owns a registry, registered schemas can **reference
+each other** with `{"$ref": "<registered-name>"}` - shared shapes are
+registered once and composed, and a `$ref` resolves through the registry at
+validation time (so a schema may reference one registered after it). `$ref`
+is not an identifier, so it keeps its quotes - exactly as it would in
+JavaScript:
+
+```dragon
+import json
+from json import Schema, ValidationResult, ValidationError
+
+s: Schema = Schema("draft-07")
+s.register("address", {
+    type: "object",
+    required: ["city"],
+    properties: {city: {type: "string", minLength: 1}}
+})
+s.register("person", {
+    type: "object",
+    required: ["name", "home"],
+    properties: {
+        name: {type: "string"},
+        home: {"$ref": "address"}
+    }
+})
+
+const r: ValidationResult = s.validate("person", {name: "ada", home: {city: ""}})
+const errs: list[ValidationError] = r.errors
+for e in errs {
+    print(f"{e.path}: {e.message}")   # $.home.city: string shorter than minLength 1
+}
+```
+
+Self-referencing schemas work too - a tree schema whose `items` is
+`{"$ref": "node"}` validates its own children; a pure ref *cycle* (a schema
+that is nothing but a `$ref` back to itself) is reported as an error rather
+than recursing forever, and a `$ref` to a name that was never registered
+reports `unknown $ref '<name>'` at the offending path.
+
+The supported keywords are the practical core of Draft 7: `type` (a single
+name or a list of names), `enum` (deep equality), `$ref` (a registered
+schema name), `required` and `properties` for objects, `items` /
+`minItems` / `maxItems` for arrays, `minLength` / `maxLength` for strings,
+and `minimum` / `maximum` for numbers. Unknown keywords are ignored, as in
+every JSON Schema validator. The semantics follow the spec where it matters:
+`"number"` accepts integers, `"integer"` rejects fractions, and booleans are
+never integers.
+
+Registration mutates the instance - register at startup, not concurrently
+from server worker threads; validation is read-only and safe to share.
+
 > **Differs from Python.** `json.loads` returns an `Any` tree, not a
 > `dict`/`list`, and a boxed `Any` does not unbox under a direct subscript -
 > reach for `loads_obj` (typed `dict[str, Any]`) or the `loads_*` scalar
 > decoders, which is where the typed, zero-box path lives. There is no
 > `object_hook`, `indent=`, or `sort_keys=` keyword; `dumps` emits compact
-> output.
+> output. Schema validation has no CPython stdlib counterpart at all - it
+> replaces the third-party `jsonschema`/`fastjsonschema` dependency.
 
 ## csv
 
@@ -125,7 +233,7 @@ escapes:
 ```dragon
 import csv
 
-const row: list[str] = csv.parse_row("ada,36,\"Lovelace, A.\"", ",")
+const row: list[str] = csv.parse_row('ada,36,"Lovelace, A."', ",")
 print(row)     # ['ada', '36', 'Lovelace, A.']
 ```
 
@@ -140,7 +248,7 @@ const rows: list[list[str]] = csv.parse_rows("a,b\n1,2\n3,4", ",")
 print(len(rows))      # 3
 print(rows[1])        # ['1', '2']
 
-const fields: list[str] = ["plain", "has,comma", "with\"quote"]
+const fields: list[str] = ["plain", "has,comma", 'with"quote']
 print(csv.format_row(fields, ","))   # plain,"has,comma","with""quote"
 ```
 
@@ -163,7 +271,7 @@ key like `server.port` addresses `port` inside a `[server]` table:
 ```dragon
 import tomllib
 
-const src: str = "title = \"Dragon\"\n[server]\nport = 8080\ndebug = true\nratio = 0.75"
+const src: str = 'title = "Dragon"\n[server]\nport = 8080\ndebug = true\nratio = 0.75'
 const doc: tomllib.TomlDoc = tomllib.loads(src)
 
 print(doc.get("title"))              # Dragon
@@ -370,6 +478,7 @@ check), and `uuid_compare(a, b) -> int` for canonical lexicographic ordering.
 | Decode a JSON object | `obj: dict[str, Any] = json.loads_obj(s)` |
 | Decode a typed JSON scalar/array | `json.loads_int(s)`, `loads_str`, `loads_list_int`, … |
 | Encode any value to JSON | `json.dumps(value) -> str` |
+| Validate against JSON Schemas | `s: Schema = Schema("draft-07")`; `s.register(name, schema)`; `s.validate(name, v)` |
 | Split a CSV line | `csv.parse_row(line, ",") -> list[str]` |
 | Join CSV fields | `csv.format_row(fields, ",") -> str` |
 | Read TOML | `doc = tomllib.loads(text)`; `doc.get_int("a.b")` |

@@ -12,9 +12,19 @@ from deps import SECRET
 from controllers.eggs.web import login_page, login_submit, signup_page, signup_submit, logout, account_page, token_create, token_revoke, index_page, search_page, detail_page
 from controllers.eggs.api import api_publish, api_download, api_search, api_yank, api_eggs, api_fetch, api_log_checkpoint, api_log, api_log_pubkey, api_log_inclusion, api_log_consistency
 from views.www import render_landing, render_download, render_benchmarks
-from controllers.docs.docs import docs_redirect, docs_page
+from controllers.docs.docs import docs_redirect, docs_page, docs_search_index
 
-const PORT: int = 2018
+extern "C" def getenv(name: str) -> str
+
+def _env_int(name: str, fallback: int) -> int {
+    const v: str = getenv(name)
+    if len(v) > 0 {
+        return int(v)
+    }
+    return fallback
+}
+
+const PORT: int = _env_int("DRAGON_SITE_PORT", 2018)
 const HOST: str = "127.0.0.1"
 
 # Thin wrappers adapting the no-arg marketing renderers to the handler signature.
@@ -43,6 +53,8 @@ app.GET('/', landing)
 app.GET('/download', download)
 app.GET('/benchmarks', benchmarks)
 app.GET('/docs', docs_redirect)
+# Static route before the :slug param route so it isn't swallowed as a slug.
+app.GET('/docs/search-index.json', docs_search_index)
 app.GET('/docs/:slug', docs_page)
 
 # Browse packages

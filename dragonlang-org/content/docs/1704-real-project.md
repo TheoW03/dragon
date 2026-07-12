@@ -186,7 +186,7 @@ def _render_code_block(lang: str, lines: list[str]) -> str {
     }
     open_tag: str = "<pre><code>"
     if len(lang) > 0 {
-        open_tag = "<pre><code class=\"language-" + _html_escape(lang) + "\">"
+        open_tag = '<pre><code class="language-' + _html_escape(lang) + '">'
     }
     return open_tag + highlight(lang, body) + "</code></pre>\n"
 }

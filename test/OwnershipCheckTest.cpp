@@ -199,6 +199,59 @@ TEST(OwnershipCheckTest, OwnFieldBorrowStoreErrors) {
     EXPECT_NE(e.find("sole ownership"), std::string::npos) << e;
 }
 
+// The own-transfer slice: a bare name that is a LIVE sole owner - an `own`
+// parameter or a fresh-owned local - stored into an own field is an IMPLICIT
+// move, no `own` keyword needed at the store (matches the book's
+// `self._data = d`). Compiles.
+TEST(OwnershipCheckTest, OwnParamPlainStoreIntoOwnFieldCompiles) {
+    EXPECT_TRUE(ownAccepts(
+        "class Box {\n"
+        "    own _s: str\n"
+        "    def(own s: str) {\n"
+        "        self._s = s\n"
+        "    }\n"
+        "}\n"));
+}
+
+TEST(OwnershipCheckTest, FreshOwnedLocalPlainStoreIntoOwnFieldCompiles) {
+    EXPECT_TRUE(ownAccepts(
+        "class Box {\n"
+        "    own _s: str\n"
+        "    def() {\n"
+        "        v: str = \"a\" + \"b\"\n"
+        "        self._s = v\n"
+        "    }\n"
+        "}\n"));
+}
+
+// The implicit move CONSUMES the name: a later use is use-after-move, exactly
+// as with an explicit `own`.
+TEST(OwnershipCheckTest, PlainStoreIntoOwnFieldThenUseIsUseAfterMove) {
+    std::string e = ownError(
+        "class Box {\n"
+        "    own _s: str\n"
+        "    def(own s: str) -> int {\n"
+        "        self._s = s\n"
+        "        return len(s)\n"
+        "    }\n"
+        "}\n");
+    EXPECT_NE(e.find("was moved into"), std::string::npos) << e;
+}
+
+// An ALIASED/escaped owner is not a sole owner, so a plain store into a
+// sole-owner field is still refused (only a live sole owner moves).
+TEST(OwnershipCheckTest, PlainStoreOfEscapedOwnerIntoOwnFieldErrors) {
+    std::string e = ownError(
+        "class Box {\n"
+        "    own _s: str\n"
+        "    def(own s: str, sink: dict[str, str]) {\n"
+        "        sink[\"k\"] = s\n"
+        "        self._s = s\n"
+        "    }\n"
+        "}\n");
+    EXPECT_NE(e.find("sole ownership"), std::string::npos) << e;
+}
+
 TEST(OwnershipCheckTest, OwnScalarFieldErrors) {
     std::string e = ownError(
         "class Box {\n"

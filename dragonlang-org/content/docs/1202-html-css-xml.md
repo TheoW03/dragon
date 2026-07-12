@@ -102,7 +102,7 @@ exactly that:
 ```dragon
 from json import JSON
 
-name: str = "Ada \"the great\""
+name: str = 'Ada "the great"'
 doc: JSON = template[JSON] {
   {"name": "!{name}"}
 }

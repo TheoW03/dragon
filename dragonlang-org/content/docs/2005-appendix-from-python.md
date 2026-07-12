@@ -349,6 +349,45 @@ When the variation is over *types* rather than *behavior*, reach for a
 [generic](/docs/0705-generics) instead: `def f[T](...)` is monomorphized per
 type with zero boxing.
 
+### An untyped Python list is not `list[Any]`
+
+Coming from Python (or from mypy, where `list[Any]` is compatible with
+everything), the reflex for "a function that takes any list" is a
+`list[Any]` parameter. In Dragon that annotation names a concrete runtime
+layout - a 16-byte tagged box per element - which a monomorphized `list[str]`
+does not have, so a named concrete list is rejected at the boundary instead
+of being silently misread:
+
+```dragon
+def first_len(xs: list[Any]) -> int {
+    return len(xs)
+}
+def run() -> None {
+    names: list[str] = ["a", "b"]
+    n: int = first_len(names)
+    # error: argument 1 of type 'list[str]' is not assignable to parameter
+    # type 'list[Any]' (the two have different element layouts: monomorphized
+    # vs boxed; build the value with this element type at its declaration,
+    # or copy it element-wise)
+}
+```
+
+Pick the parameter type by what you mean:
+
+- **"I take one specific element type"** → the concrete type:
+  `def f(xs: list[str])`.
+- **"I work for every element type"** → a [generic](/docs/0705-generics):
+  `def f[T](xs: list[T])` - monomorphized per caller, zero boxing.
+- **"I take genuinely dynamic data"** → a bare `Any`:
+  `def f(x: Any)` accepts any list and dispatches on the real value at
+  runtime; or `list[Any]` if the data is *built* dynamic from birth, the way
+  `json.loads` builds it.
+
+A fresh literal argument still reads naturally - `f(["a", "b"])` against a
+`list[Any]` parameter builds the box layout directly, exactly like
+`xs: list[Any] = ["a", "b"]` does. See [Lists](/docs/0501-lists) for the
+full layout rule.
+
 ### Reflection → model the data explicitly
 
 `getattr` / `setattr` / `hasattr`, `__dict__`, monkeypatching, and

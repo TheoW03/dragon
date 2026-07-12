@@ -31,21 +31,22 @@ is current as of this writing.
 
 | Benchmark | Dragon | Rust | Verdict |
 |---|---|---|---|
-| Fibonacci (recursive, n=42) | 0.848s | 0.986s | **Dragon 1.16× faster** |
-| Mandelbrot (float, 1600², 100 iter) | 0.421s | 0.452s | **Dragon 1.07× faster** |
+| Fibonacci (recursive, n=42) | 0.857s | 0.878s | **Dragon 1.02× faster** |
+| Mandelbrot (float, 1600², 100 iter) | 0.457s | 0.457s | tie |
 | Sieve of Eratosthenes (1M) | 0.007s | 0.006s | tie (noise) |
 | String concat (10k) | 0.003s | 0.003s | tie (noise) |
-| Object creation (1M) | 0.002s | 0.003s | tie (noise) |
-| Parallel sum (8×30M fork-join) | 0.174s | 0.149s | Dragon 1.17× slower |
-| Dictionary / hashmap (3M str-key ops) | 1.144s | 0.666s | Dragon 1.72× slower |
-| Binary trees (alloc churn, depth 14) | 0.255s | 0.095s | Dragon 2.68× slower |
+| Object creation (1M) | 0.006s | 0.003s | tie (noise) |
+| Parallel sum (8×30M fork-join) | 0.214s | 0.149s | Dragon 1.44× slower |
+| Dictionary / hashmap (3M str-key ops) | 1.657s | 0.704s | Dragon 2.35× slower |
+| Binary trees (alloc churn, depth 14) | 0.316s | 0.089s | Dragon 3.55× slower |
 
-The headline result is real: on **compute-bound** work Dragon is at or
-ahead of `rustc`. Recursive integer math and tight floating-point loops -
-where the program is dominated by arithmetic, not allocation - lean
-entirely on the LLVM backend and the native-typed value model, and there
-Dragon already wins. (On fib it also beats Go and Java, and trails C and
-C++ by only about 12%.)
+The headline result is real: on **compute-bound** work Dragon runs at
+parity with `rustc` - a tie on mandelbrot, a hair ahead on recursive
+`fib`. Recursive integer math and tight floating-point loops - where the
+program is dominated by arithmetic, not allocation - lean entirely on the
+LLVM backend and the native-typed value model, and there Dragon matches a
+mature systems compiler. (On fib it also beats Go and Java outright and
+trails C and C++ by under 30%.)
 
 The fib benchmark is just ordinary Dragon, compiled with `--release`:
 
@@ -73,36 +74,41 @@ The losses are kept visible on purpose - hiding them would violate the
 second commandment more than having them does. All three slow rows share
 a cause, and it is *not* code generation:
 
-- **Binary trees (2.68× slower)** is the worst, and it is pure
+- **Binary trees (3.55× slower)** is the worst, and it is pure
   allocate-and-free churn. It barely computes anything; it measures the
-  **reference-counting runtime**, not the compiler. Every tree node is a
-  pair of refcount operations, and at this allocation rate that
-  bookkeeping dominates. It is the canary benchmark: it will move the day
-  the runtime stops counting acyclic objects it can prove never form
-  cycles.
-- **Dicts (1.72× slower)** is a string-keyed hashmap. The suspect is the
+  **memory-management runtime**, not the compiler. The `Node` type holds
+  `Node` fields, so it cannot be *statically* proven acyclic - the cyclic
+  collector must consider it. But the trees this benchmark builds never
+  actually form cycles; reference counting frees every node the instant it
+  goes out of scope, and each cyclic-collection pass scans the live set and
+  reclaims nothing. The runtime now backs off that trigger adaptively -
+  when a collection frees no cycles it grows the interval before the next
+  one (bounded proportional to the live set, so genuine cyclic garbage is
+  still caught) - which cut this row from over 1.7 seconds to its current
+  time. Closing the rest of the gap is a static-escape or generational
+  question, not a code-generation one.
+- **Dicts (2.35× slower)** is a string-keyed hashmap. The suspect is the
   hash-and-compare path for string keys in the dictionary implementation,
   not the loop around it.
-- **Parallel sum (1.17× slower)** is the closest gap - green-thread
-  fork-join carries slightly more overhead than Rust's OS threads, though
-  Dragon still beats Java and sits near Go here.
+- **Parallel sum (1.44× slower)** is fork-join over eight workers -
+  green-thread scheduling carries more overhead than Rust's raw OS threads,
+  though Dragon still beats Java here.
 
 The sub-10-millisecond rows - sieve, string concat, object creation - are
-**noise, not signal**. They finish in two to seven milliseconds, where
-process startup, not the workload, dominates the clock. (That object
-creation lands at two milliseconds is itself worth noting: the
-refcount-tracking overhead that used to show up at this scale no longer
-does.)
+**noise, not signal**. They finish in three to seven milliseconds, where
+process startup, not the workload, dominates the clock and run-to-run
+jitter swamps any real difference.
 
 ## The work in front of the commandments
 
 Because *speed is king*, the allocation and hashmap paths are the
 highest-leverage targets, and they are exactly what the runtime work
 focuses on next - not new features stacked on top, but the slow rows
-driven down. The plan is the kind of root-cause fix the second
-commandment demands: teach the refcounter to skip objects it can prove
-are acyclic (so binary-trees stops paying for cycle-safety it never
-needs), and profile the string-key hash path until the dict gap closes.
+driven down. The adaptive cycle-collection trigger described above is one
+such root-cause fix already landed; the next steps are the same shape:
+static-escape analysis so a provably-acyclic allocation is never tracked
+at all (driving binary-trees the rest of the way down), and profiling the
+string-key hash path until the dict gap closes.
 
 This is the honest shape of a young compiled language: the codegen story
 is already won, and the remaining gaps are in the runtime data structures,

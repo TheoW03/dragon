@@ -267,12 +267,14 @@ a:hover { color: var(--link-hover); text-decoration: underline; }
 .sidebar {
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border);
-    overflow-y: auto;
-    /* Hide the scrollbar but keep scrolling: the sidebar stays draggable /
-       wheel- and touch-scrollable, just without the visible track. */
-    scrollbar-width: none;          /* Firefox */
-    -ms-overflow-style: none;       /* legacy Edge / IE */
-    padding: 18px 12px 60px 18px;
+    /* Flex column: the brand heading + search box are pinned at the top
+       (flex:0 0 auto) and only the nav list (.sb-list) scrolls, so the reader
+       never has to scroll the TOC back up to reach search. The sidebar itself
+       does not scroll - overflow stays visible so the search dropdown can
+       overlay the list below it. */
+    display: flex;
+    flex-direction: column;
+    padding: 18px 12px 0 18px;      /* bottom padding moves onto .sb-list */
     position: sticky;
     top: 50px;
     height: calc(100vh - 50px);
@@ -281,9 +283,15 @@ a:hover { color: var(--link-hover); text-decoration: underline; }
     font-size: 15px;
     line-height: 1.5;
 }
-.sidebar::-webkit-scrollbar { width: 0; height: 0; }  /* WebKit / Blink */
+/* Re-assert the narrow-viewport hide: the base rule above sets display:flex,
+   which (equal specificity, later in source) would otherwise beat the
+   max-width:800px `display:none` declared earlier in the file. */
+@media (max-width: 800px) {
+    .sidebar { display: none; }
+}
 
 .sb-heading {
+    flex: 0 0 auto;                 /* pinned - never scrolls with the TOC */
     font-family: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont,
                  "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
     font-weight: 700;
@@ -295,9 +303,19 @@ a:hover { color: var(--link-hover); text-decoration: underline; }
 }
 .sb-heading:first-child { margin-top: 4px; }
 
+/* The scrolling TOC. flex:1 + min-height:0 lets it shrink below its content
+   height so its own overflow scrolls (the classic flexbox-scroll fix); the
+   scrollbar is hidden but wheel/touch scrolling stays. */
 .sb-list {
-    margin: 0 0 4px 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: none;          /* Firefox */
+    -ms-overflow-style: none;       /* legacy Edge / IE */
+    margin: 0;
+    padding-bottom: 60px;
 }
+.sb-list::-webkit-scrollbar { width: 0; height: 0; }  /* WebKit / Blink */
 
 /* Numbers - bold, tabular so columns line up vertically across rows. */
 .sb-num {
@@ -396,6 +414,121 @@ a:hover { color: var(--link-hover); text-decoration: underline; }
     color: var(--fg);
 }
 .sb-sections li.sb-active > a .sb-num { color: var(--fg); }
+
+/* Third level: a page's own in-page headings (##/###), shown only under the
+   active page. A quiet left rail groups them under their parent section. */
+.sb-subsections {
+    list-style: none;
+    padding: 0;
+    margin: 2px 0 6px 0;
+    border-left: 1px solid var(--border);
+    margin-left: 14px;
+}
+.sb-subsections li { margin: 0; }
+.sb-subsections li a {
+    display: block;
+    border-radius: 4px;
+    padding: 4px 8px 4px 14px;
+    color: var(--fg-muted);
+    font-size: 13.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.sb-sub-3 a { padding-left: 28px; }        /* h3 nests under its h2 */
+.sb-subsections li a:hover {
+    background: var(--bg-code);
+    color: var(--link);
+    text-decoration: none;
+}
+.sb-subsections li a.sb-sub-active {
+    color: var(--fg);
+    font-weight: 600;
+}
+.sb-subnum {
+    margin-right: 5px;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-muted);
+    font-size: 12px;
+}
+
+/* ---------- docs search ---------- */
+.sb-search {
+    flex: 0 0 auto;                 /* pinned above the scrolling TOC */
+    position: relative;
+    margin: 0 6px 14px 6px;
+}
+.sb-search-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 14px;
+    outline: none;
+}
+.sb-search-input:focus {
+    border-color: var(--link);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 20%, transparent);
+}
+.docsearch-results {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 40;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--bg-sidebar);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+    padding: 4px;
+}
+.docsearch-item {
+    display: block;
+    padding: 7px 10px;
+    border-radius: 6px;
+    color: var(--fg);
+    cursor: pointer;
+}
+.docsearch-item:hover,
+.docsearch-item.active {
+    background: var(--active);
+    text-decoration: none;
+}
+.docsearch-title {
+    font-weight: 600;
+    font-size: 14px;
+}
+.docsearch-title mark {
+    background: color-mix(in srgb, var(--link) 30%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+.docsearch-page {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-left: 6px;
+}
+.docsearch-snippet {
+    display: block;
+    font-size: 12.5px;
+    color: var(--fg-muted);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.docsearch-empty {
+    padding: 10px 12px;
+    color: var(--fg-muted);
+    font-size: 13.5px;
+}
 
 /* ---------- content ---------- */
 

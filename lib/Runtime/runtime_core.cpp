@@ -24,7 +24,13 @@ void** gc_tracked = nullptr;
 int32_t gc_tracked_size = 0;
 int32_t gc_tracked_cap = 0;
 int32_t gc_alloc_counter = 0;
-int32_t gc_threshold = 700;
+// Baseline (and floor) for the cycle-collection trigger. The threshold is
+// ADAPTIVE from here (see the tail of dragon_gc_collect): it backs off when a
+// pass reclaims no cycles and snaps back when one does, so pure acyclic churn
+// - which refcounting frees promptly - stops paying for full tracked-set scans
+// that reclaim nothing.
+static const int32_t GC_BASE_THRESHOLD = 700;
+int32_t gc_threshold = GC_BASE_THRESHOLD;
 int gc_collecting = 0;
 
 // Concurrency latch (see runtime_internal.h). 0 until a second heap-mutating OS
@@ -1037,6 +1043,33 @@ int64_t dragon_gc_collect() {
     free(queue);
 
     pthread_mutex_lock(&gc_lock);
+    // Adaptive trigger for the NEXT collection. `collected` is how many cyclic
+    // objects this pass reclaimed; `gc_tracked_size` is the live tracked set
+    // that survived. A fixed count-of-N trigger makes acyclic churn (trees,
+    // records - freed immediately by refcounting) pay for a full O(live) scan
+    // every N allocations that finds nothing: a needless GC pass, i.e. a speed
+    // defect. So back off geometrically when a pass reclaims nothing, and snap
+    // back to the aggressive baseline the moment one does. The back-off is
+    // capped proportional to the live set (GC_BASE + 8×live) so a program that
+    // starts producing cycles after a churn burst still triggers before memory
+    // can grow far past its live footprint. This changes only WHEN the cycle
+    // collector runs - never correctness: refcounting still frees acyclic
+    // objects at once, and true cycles are still collected, just not scanned
+    // for uselessly during churn.
+    {
+        int32_t live = gc_tracked_size;
+        int64_t next;
+        if (collected == 0) {
+            next = (int64_t)gc_threshold * 2;          // found nothing -> back off
+        } else {
+            next = GC_BASE_THRESHOLD;                   // found cycles -> stay eager
+        }
+        int64_t cap = (int64_t)GC_BASE_THRESHOLD + (int64_t)live * 8;
+        if (next > cap) next = cap;
+        if (next < GC_BASE_THRESHOLD) next = GC_BASE_THRESHOLD;
+        if (next > 2147483647LL) next = 2147483647LL;   // clamp to int32
+        __atomic_store_n(&gc_threshold, (int32_t)next, __ATOMIC_RELAXED);
+    }
     __atomic_store_n(&gc_collecting, 0, __ATOMIC_RELEASE);
     gc_in_progress = 0;
     pthread_mutex_unlock(&gc_lock);

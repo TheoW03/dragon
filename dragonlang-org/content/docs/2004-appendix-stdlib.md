@@ -37,7 +37,7 @@ statically linked the same way. Either way, nothing is fetched at build time.
 
 | Module | Purpose |
 |--------|---------|
-| `json` | JSON encode/decode. **Non-Python shape:** the API is *monomorphized* - typed functions like `dumps_int`, `dumps_list_str`, `loads_float`, `loads_list_str`, plus `detect_type`, rather than a single generic `dumps`/`loads`. Handles flat values and homogeneous arrays. Also hosts the `JSON` `template` content type. |
+| `json` | JSON encode/decode/validate. Generic `dumps(obj)` / `loads -> Any` for the convenience tier, plus a *monomorphized* typed family (`dumps_int`, `dumps_list_str`, `loads_float`, `loads_list_str`, ...) for hot paths, and a JSON Schema validator - the `Schema` class owns a registry: `register(name, schema)` compiles immediately, `validate(name, payload)` -> `ValidationResult`, schemas compose via `$ref` (Draft 7 subset; replaces the third-party `jsonschema` dependency). Also hosts the `JSON` `template` content type. |
 | `csv` | CSV reading/writing with quoted fields, escaped quotes, configurable delimiters. Pure Dragon. |
 | `configparser` | INI-file parser - sections, `=`/`:` key-values, `#`/`;` comments, whitespace stripping. Pure Dragon. |
 | `tomllib` | Read-only TOML parser matching Python 3.11+ `tomllib` (practical subset; no arrays-of-tables, inline tables, multi-line strings, or datetimes). |

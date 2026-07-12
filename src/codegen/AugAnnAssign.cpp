@@ -1570,28 +1570,47 @@ void CodeGen::visit(AnnAssignStmt& node) {
                     impl_->varTypedDictClass[name->name] = typedDictClassName;
                 }
 
+                // An EXPLICIT concrete annotation is authoritative: `x: str`,
+                // `x: int`, `x: list[T]`, ... is that type, full stop. The
+                // RHS-class-detection fallbacks below (which guess a class
+                // from the value expression) must NOT override it. Skipping
+                // them also stops a stale, program-wide `varClassNames` entry
+                // for the RHS variable name from bleeding a bogus class onto a
+                // differently-typed target: `const name: str = r` where `r` is
+                // an Any/Union loop var whose name collides with some class
+                // instance elsewhere resolved to `<Class>`, and `name` was
+                // stamped ClassInstance -> generic dragon_decref on a string at
+                // scope exit (heap corruption). Only Union / ClassInstance /
+                // Other / Unknown targets can legitimately acquire a class here.
+                bool targetMayBeClass =
+                    varKind == Impl::VarKind::ClassInstance ||
+                    varKind == Impl::VarKind::Union ||
+                    varKind == Impl::VarKind::Other;
                 if (!annotClassName.empty()) {
                     impl_->varClassNames[name->name] = annotClassName;
                     // GC Phase 3: varKind already set to ClassInstance via typeExprToKind
-                } else if (auto* callVal = dynamic_cast<CallExpr*>(node.value.get())) {
-                    if (auto* calleeName = dynamic_cast<NameExpr*>(callVal->callee.get())) {
-                        if (impl_->classNames.count(calleeName->name)) {
-                            impl_->varClassNames[name->name] = calleeName->name;
-                            // GC Phase 3: set ClassInstance kind for scope-exit
-                            // decref - but NEVER on a box slot. `p: Any =
-                            // Dog(...)` allocates a 16-byte {tag, payload} box;
-                            // its kind must stay Union so cleanup extracts the
-                            // payload. Overriding to ClassInstance made cleanup
-                            // load the first 8 bytes (the TAG, 7) as a pointer
-                            // and dragon_decref(7) SEGV'd at scope exit.
-                            if (impl_->options.gcMode == GCMode::RC &&
-                                alloca->getAllocatedType() != impl_->boxType)
-                                impl_->setVar(name->name, alloca, Impl::VarKind::ClassInstance);
+                } else if (targetMayBeClass) {
+                    if (auto* callVal = dynamic_cast<CallExpr*>(node.value.get())) {
+                        if (auto* calleeName = dynamic_cast<NameExpr*>(callVal->callee.get())) {
+                            if (impl_->classNames.count(calleeName->name)) {
+                                impl_->varClassNames[name->name] = calleeName->name;
+                                // GC Phase 3: set ClassInstance kind for scope-exit
+                                // decref - but NEVER on a box slot. `p: Any =
+                                // Dog(...)` allocates a 16-byte {tag, payload} box;
+                                // its kind must stay Union so cleanup extracts the
+                                // payload. Overriding to ClassInstance made cleanup
+                                // load the first 8 bytes (the TAG, 7) as a pointer
+                                // and dragon_decref(7) SEGV'd at scope exit.
+                                if (impl_->options.gcMode == GCMode::RC &&
+                                    alloca->getAllocatedType() != impl_->boxType)
+                                    impl_->setVar(name->name, alloca, Impl::VarKind::ClassInstance);
+                            }
                         }
                     }
                 }
-                // Fallback: detect class instances from complex expressions
-                if (!impl_->varClassNames.count(name->name)) {
+                // Fallback: detect class instances from complex expressions.
+                // Gated on targetMayBeClass for the same reason as above.
+                if (targetMayBeClass && !impl_->varClassNames.count(name->name)) {
                     auto cls = impl_->resolveExprClassName(node.value.get());
                     if (!cls.empty()) {
                         impl_->varClassNames[name->name] = cls;

@@ -559,6 +559,144 @@ void CodeGen::visit(ForStmt& node) {
     }
 
     // --- For-in on collection (list, string, or dict) ---
+    // D039: `for x in <Any>` - a box-typed iterable. The payload may hold
+    // EITHER list representation (the monomorphized DragonList family or a
+    // DragonListBox), so the loop must not assume a layout: dragon_box_len
+    // sizes it (raising the Python-shaped TypeError for non-sized values) and
+    // dragon_box_subscript header-dispatches every element read, returning an
+    // OWNED box. The loop var is itself an Any box - narrow it in the body
+    // with isinstance. Previously an Any iterable fell into the native-list
+    // default and walked the payload at the 8-byte stride: a list[str]
+    // yielded raw pointers tagged int, a list[Any] yielded interleaved
+    // tag/payload words.
+    {
+        bool iterMayBeBox = false;
+        if (node.iterable->type &&
+            (node.iterable->type->kind() == Type::Kind::Any ||
+             node.iterable->type->kind() == Type::Kind::Union))
+            iterMayBeBox = true;
+        if (auto* nm = dynamic_cast<NameExpr*>(node.iterable.get())) {
+            // A name's VarKind is the codegen truth: a Union-kind slot IS a
+            // box; a name rebound by isinstance narrowing to a concrete kind
+            // is NOT, even though its static type may still read Any.
+            iterMayBeBox = impl_->lookupVarKind(nm->name) == Impl::VarKind::Union;
+        }
+        auto* boxTarget = dynamic_cast<NameExpr*>(node.target.get());
+        if (iterMayBeBox && boxTarget) {
+            node.iterable->accept(*this);
+            llvm::Value* iterBox = impl_->lastValue;
+            // Non-box lowerings of an Any-typed expression are not expected
+            // (the type says box); coerce defensively rather than re-evaluate
+            // the iterable through a different path. A scalar coerces to an
+            // int box, and dragon_box_len then raises the honest TypeError.
+            if (iterBox->getType() != impl_->boxType) {
+                if (iterBox->getType()->isPointerTy())
+                    iterBox = impl_->makeBox(
+                        llvm::ConstantInt::get(impl_->i64Type, 5), iterBox);
+                else
+                    iterBox = impl_->makeBox(
+                        llvm::ConstantInt::get(impl_->i64Type, 0), iterBox);
+            }
+            bool ownedIterable = impl_->options.gcMode == GCMode::RC &&
+                                 impl_->isOwnedBoxResult(iterBox);
+
+            auto* lenV = impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_box_len"], {iterBox},
+                "boxiter.len");
+            auto* idxA = impl_->createEntryAlloca(
+                func, "boxiter.i." + std::to_string(impl_->forIterCounter++),
+                impl_->i64Type);
+            impl_->builder->CreateStore(
+                llvm::ConstantInt::get(impl_->i64Type, 0), idxA);
+            auto* loopVar = impl_->createEntryAlloca(
+                func, boxTarget->name, impl_->boxType);
+            impl_->builder->CreateStore(
+                llvm::Constant::getNullValue(impl_->boxType), loopVar);
+            impl_->setVar(boxTarget->name, loopVar, Impl::VarKind::Union);
+
+            auto* condBB = llvm::BasicBlock::Create(*impl_->context, "boxiter.cond", func);
+            auto* bodyBB = llvm::BasicBlock::Create(*impl_->context, "boxiter.body", func);
+            auto* incrBB = llvm::BasicBlock::Create(*impl_->context, "boxiter.incr", func);
+            auto* endBB  = llvm::BasicBlock::Create(*impl_->context, "boxiter.end", func);
+            llvm::BasicBlock* elseBB = node.elseBody.empty()
+                ? endBB
+                : llvm::BasicBlock::Create(*impl_->context, "boxiter.else", func);
+
+            impl_->loopStack.push({endBB, incrBB, impl_->scopes.size(),
+                                   impl_->tryFrameFuncs.size(),
+                                   impl_->exitCleanupStack.size()});
+            impl_->builder->CreateBr(condBB);
+
+            impl_->builder->SetInsertPoint(condBB);
+            auto* iCur = impl_->builder->CreateLoad(impl_->i64Type, idxA, "boxiter.icur");
+            auto* inRange = impl_->builder->CreateICmpSLT(iCur, lenV, "boxiter.cmp");
+            impl_->builder->CreateCondBr(inRange, bodyBB, elseBB);
+
+            impl_->builder->SetInsertPoint(bodyBB);
+            auto* idxBox = impl_->makeBox(
+                llvm::ConstantInt::get(impl_->i64Type, 0), iCur);
+            auto* elemBox = impl_->builder->CreateCall(
+                impl_->runtimeFuncs["dragon_box_subscript"],
+                {iterBox, idxBox}, "boxiter.elem");
+            // The element box is OWNED (+1 on heap payloads): release the
+            // previous iteration's element before overwriting (the slot
+            // starts zeroed, so the first decref no-ops).
+            if (impl_->options.gcMode == GCMode::RC) {
+                auto* prev = impl_->builder->CreateLoad(
+                    impl_->boxType, loopVar, "boxiter.prev");
+                impl_->emitUnionDecref(
+                    impl_->boxPayloadI64(prev, "boxiter.prev.pay"),
+                    impl_->boxTag(prev, "boxiter.prev.tag"));
+            }
+            impl_->builder->CreateStore(elemBox, loopVar);
+            impl_->pushScope();
+            for (auto& stmt : node.body) stmt->accept(*this);
+            impl_->emitScopeCleanup();
+            impl_->popScope();
+            if (!impl_->builder->GetInsertBlock()->getTerminator())
+                impl_->builder->CreateBr(incrBB);
+
+            impl_->builder->SetInsertPoint(incrBB);
+            auto* iNext = impl_->builder->CreateAdd(
+                impl_->builder->CreateLoad(impl_->i64Type, idxA, "boxiter.i2"),
+                llvm::ConstantInt::get(impl_->i64Type, 1), "boxiter.inext");
+            impl_->builder->CreateStore(iNext, idxA);
+            impl_->builder->CreateBr(condBB);
+
+            impl_->loopStack.pop();
+
+            if (elseBB != endBB) {
+                impl_->builder->SetInsertPoint(elseBB);
+                impl_->pushScope();
+                for (auto& stmt : node.elseBody) stmt->accept(*this);
+                impl_->emitScopeCleanup();
+                impl_->popScope();
+                if (!impl_->builder->GetInsertBlock()->getTerminator())
+                    impl_->builder->CreateBr(endBB);
+            }
+
+            impl_->builder->SetInsertPoint(endBB);
+            // Release the LAST element (break and natural exhaustion both
+            // land here), neutralize the slot so any later cleanup can't
+            // double-free, and drop the iterable's own +1 if its expression
+            // produced an owned box temporary.
+            if (impl_->options.gcMode == GCMode::RC) {
+                auto* last = impl_->builder->CreateLoad(
+                    impl_->boxType, loopVar, "boxiter.last");
+                impl_->emitUnionDecref(
+                    impl_->boxPayloadI64(last, "boxiter.last.pay"),
+                    impl_->boxTag(last, "boxiter.last.tag"));
+                impl_->builder->CreateStore(
+                    llvm::Constant::getNullValue(impl_->boxType), loopVar);
+                if (ownedIterable)
+                    impl_->emitUnionDecref(
+                        impl_->boxPayloadI64(iterBox, "boxiter.it.pay"),
+                        impl_->boxTag(iterBox, "boxiter.it.tag"));
+            }
+            return;
+        }
+    }
+
     // Determine iterable type, including dict iteration patterns
     bool isStrIterable = false;
     bool isListIterable = false;

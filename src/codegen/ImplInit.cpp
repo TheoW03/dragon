@@ -385,6 +385,11 @@ void CodeGen::Impl::declareRuntimeFunctions() {
     // vs DragonListBox, elem_tag) doesn't match the typed view unboxing it.
     getOrDeclareRuntime("dragon_list_view_check",
         llvm::FunctionType::get(voidType, {i8PtrType, i64Type}, false));
+    // i64 dragon_box_len(%dragon.box) - len() of an Any value, tag + header
+    // dispatched (str/list-of-either-representation/dict/bytes); raises the
+    // Python-shaped TypeError for unsized values.
+    getOrDeclareRuntime("dragon_box_len",
+        llvm::FunctionType::get(i64Type, {boxType}, false));
     // void dragon_list_box_set(ptr list, i64 index, i64 tag, i64 payload)
     getOrDeclareRuntime("dragon_list_box_set",
         llvm::FunctionType::get(voidType, {i8PtrType, i64Type, i64Type, i64Type}, false));

@@ -9,8 +9,9 @@ from http.server import Request, Response, Context
 from io import open
 from os import listdir
 from os.path import join as path_join, exists, isfile
-from markdown import render
+from markdown import render, slug
 from html import HTML
+import json
 from views.www import topbar, footer
 
 
@@ -239,8 +240,163 @@ def _load_summary(docs_dir: str) -> list[Chapter] {
 const DOCS_CHAPTERS: list[Chapter] = _load_summary(DOCS_DIR)
 
 
+# One in-page heading of a doc (an `##` or `###` line). `anchor` is the slug
+# the markdown renderer stamped as the heading's id, so a sidebar link
+# `/docs/<slug>#<anchor>` lands on it. `number` is the pre-rendered label
+# (e.g. "14.4.1" for the first `##` of section 14.4, "14.4.1.2" for its
+# second `###`). `level` is 2 (`##`) or 3 (`###`).
+class Heading {
+    def(text: str, anchor: str, number: str, level: int) {
+        self.text = text
+        self.anchor = anchor
+        self.number = number
+        self.level = level
+    }
+}
+
+
+# Crude inline-markdown stripper for search snippets: drop the markers that
+# would otherwise clutter a plain-text preview. Not a parser - just enough to
+# make a heading's following prose readable in a results dropdown.
+def _strip_md(s: str) -> str {
+    out: list[str] = []
+    i: int = 0
+    while i < len(s) {
+        const ch: str = s[i]
+        if ch == "`" or ch == "*" or ch == "_" or ch == "[" or ch == "]" or ch == "#" or ch == ">" {
+            # skip marker
+            i = i + 1
+            continue
+        }
+        out.append(ch)
+        i = i + 1
+    }
+    return "".join(out)
+}
+
+
+# Extract a page's `##`/`###` headings, numbered relative to the page's own
+# section number (`page_number`, e.g. "14.4."). Fenced code blocks are skipped
+# so a `#` comment inside a ```dragon block is never mistaken for a heading.
+def _extract_headings(md: str, page_number: str) -> list[Heading] {
+    const out: list[Heading] = []
+    const lines: list[str] = md.split("\n")
+    in_fence: bool = False
+    h2: int = 0
+    h3: int = 0
+    i: int = 0
+    while i < len(lines) {
+        const line: str = lines[i]
+        if line.startswith("```") or line.startswith("~~~") {
+            in_fence = not in_fence
+            i = i + 1
+            continue
+        }
+        if not in_fence {
+            if line.startswith("## ") and not line.startswith("### ") {
+                h2 = h2 + 1
+                h3 = 0
+                const t: str = line[3:]
+                out.append(Heading(t, slug(t), f"{page_number}{h2}", 2))
+            } elif line.startswith("### ") and not line.startswith("#### ") {
+                h3 = h3 + 1
+                const t: str = line[4:]
+                # `14.4.` + h2 + `.` + h3  ->  "14.4.2.1"
+                const num: str = f"{page_number}{h2}.{h3}"
+                out.append(Heading(t, slug(t), num, 3))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+# The first paragraph of a page's body, stripped and truncated - a search
+# result's preview line. Skips the H1 and any leading blanks; stops at the
+# first blank line after prose begins.
+def _first_paragraph(md: str) -> str {
+    const lines: list[str] = md.split("\n")
+    buf: list[str] = []
+    in_fence: bool = False
+    i: int = 0
+    while i < len(lines) {
+        const line: str = lines[i]
+        if line.startswith("```") or line.startswith("~~~") {
+            in_fence = not in_fence
+            i = i + 1
+            continue
+        }
+        const t: str = line.strip()
+        if in_fence or len(t) == 0 or t.startswith("#") {
+            if len(buf) > 0 {
+                break
+            }
+            i = i + 1
+            continue
+        }
+        buf.append(_strip_md(t))
+        i = i + 1
+    }
+    const joined: str = " ".join(buf)
+    if len(joined) > 200 {
+        return joined[:200]
+    }
+    return joined
+}
+
+
+# Per-page heading lists (slug -> headings), and the search index, both built
+# once at startup by reading every summary page. The search index is a JSON
+# array of {t: title, p: page title, u: url with anchor, b: body preview}.
+def _build_docs_index(chapters: list[Chapter], docs_dir: str) -> tuple[dict[str, list[Heading]], str] {
+    headings_by_slug: dict[str, list[Heading]] = {}
+    entries: list[dict[str, Any]] = []
+    for c in chapters {
+        if len(c.slug) == 0 {
+            continue
+        }
+        const path: str = path_join(docs_dir, c.slug + ".md")
+        if not isfile(path) {
+            continue
+        }
+        const md: str = open(path).text()
+        const hs: list[Heading] = _extract_headings(md, c.number)
+        headings_by_slug[c.slug] = hs
+        const base_url: str = "/docs/" + c.slug
+        # Page-level result (the H1 / summary title).
+        entries.append({"t": c.title, "p": "", "u": base_url, "b": _first_paragraph(md)})
+        # One result per in-page heading, linking straight to its anchor.
+        for h in hs {
+            entries.append({"t": h.text, "p": c.title, "u": base_url + "#" + h.anchor, "b": ""})
+        }
+    }
+    return (headings_by_slug, json.dumps(entries))
+}
+
+
+const _DOCS_INDEX: tuple[dict[str, list[Heading]], str] = _build_docs_index(DOCS_CHAPTERS, DOCS_DIR)
+const DOCS_HEADINGS: dict[str, list[Heading]] = _DOCS_INDEX[0]
+const SEARCH_INDEX_JSON: str = _DOCS_INDEX[1]
+
+
+# Render one in-page heading (`##`/`###`) as a third-level sidebar link, shown
+# only under the active page. Links to the heading's #anchor; the level drives
+# the indent (h3 nests under h2).
+def _render_subheading_li(h: Heading, page_slug: str) -> HTML {
+    const href: str = "/docs/" + page_slug + "#" + h.anchor
+    const cls: str = f"sb-sub sb-sub-{h.level}"
+    return template[HTML] {
+      <li class="!{cls}"><a href="!{href}" data-anchor="!{h.anchor}"><span class="sb-subnum">!{h.number}</span><span class="sb-title">!{h.text}</span></a></li>
+    }
+}
+
+
 # Render one clickable section row (a level-2 entry under a chapter, or a
-# defensive non-link if a section somehow has no slug).
+# defensive non-link if a section somehow has no slug). When this row is the
+# ACTIVE page and the page has in-page headings, a nested list of those
+# headings (the third TOC level) is rendered beneath it so `##`/`###` sections
+# like "json" or "uuid" are visible and linkable instead of hidden in the body.
 def _render_section_li(s: Chapter, active_kind: str, active_slug: str) -> HTML {
     const is_active: bool = s.kind == active_kind and s.slug == active_slug and len(s.slug) > 0
     const cls: str = "sb-level-2 sb-active" if is_active else "sb-level-2"
@@ -254,8 +410,17 @@ def _render_section_li(s: Chapter, active_kind: str, active_slug: str) -> HTML {
     if len(s.number) > 0 {
         num = template[HTML] { <span class="sb-num">!{s.number}</span> }
     }
+    subs: HTML = template[HTML] {  }
+    if is_active and s.slug in DOCS_HEADINGS {
+        const hs: list[Heading] = DOCS_HEADINGS[s.slug]
+        if len(hs) > 0 {
+            subs = template[HTML] {
+              <ol class="sb-subsections">!{ for h in hs { :{ !{_render_subheading_li(h, s.slug)} } } }</ol>
+            }
+        }
+    }
     return template[HTML] {
-      <li class="!{cls}"><a href="!{href}">!{num}<span class="sb-title">!{s.title}</span></a></li>
+      <li class="!{cls}"><a href="!{href}">!{num}<span class="sb-title">!{s.title}</span></a>!{subs}</li>
     }
 }
 
@@ -346,6 +511,10 @@ def _render_sidebar(active_kind: str, active_slug: str) -> HTML {
     }
     return template[HTML] {
       <h3 class="sb-heading">The Dragon Programming Language</h3>
+      <div class="sb-search">
+        <input type="search" id="docsearch" class="sb-search-input" placeholder="Search the docs..." autocomplete="off" spellcheck="false" aria-label="Search the documentation">
+        <div id="docsearch-results" class="docsearch-results" hidden></div>
+      </div>
       <nav class="sb-list">!{ for p in parts { :{ !{p} } } }</nav>
     }
 }
@@ -533,4 +702,13 @@ def docs_page(req: Request, res: Response, ctx: Context) -> None {
         return
     }
     _serve_chapter("docs", DOCS_DIR, slug, req.session.get("uname", ""), res)
+}
+
+
+# GET /docs/search-index.json - the prebuilt search index (titles + every
+# in-page heading, each with its anchor URL and a preview). app.js fetches it
+# once on first use and filters client-side, so there is no per-keystroke
+# server round-trip. Built once at startup (SEARCH_INDEX_JSON).
+def docs_search_index(req: Request, res: Response, ctx: Context) -> None {
+    res.json(SEARCH_INDEX_JSON)
 }

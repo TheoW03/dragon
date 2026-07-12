@@ -160,7 +160,7 @@ app: Router = Router(8732, "127.0.0.1")
 
 app.GET("/players/:id:int", lambda (req: Request, res: Response, ctx: Context) -> None {
     pid: int = req.param_int("id")
-    res.json("{\"id\": " + str(pid) + "}")
+    res.json('{"id": ' + str(pid) + '}')
 })
 
 app.listen()
@@ -274,7 +274,12 @@ or `float(...)` yourself - the wire has no types. For file uploads,
 `req.json()` *decodes* the request body, returning an `Any` tree - JSON
 objects become `dict[str, Any]`, arrays become `list[Any]`, and scalars
 are boxed. It decodes the verbatim body bytes and raises `ValueError`
-(with a byte offset) on malformed JSON. When you want the undecoded body
+(with a byte offset) on malformed JSON. Malformed is not the same as
+wrong-shaped: to enforce a contract on what the decoded JSON *contains*,
+run it through the stdlib JSON Schema validator (`json.Schema` - register
+named schemas at startup, validate each body by name; see
+[Data Formats](/docs/1404-stdlib-data)) and reply `422` with the error
+paths on a miss. When you want the undecoded body
 to validate or parse yourself, read `req.body`, the raw request body as a
 `str`. For a known shape, `T(**json.loads_obj(req.body))` decodes
 straight into your type. `req.query_str(name, default)` and its typed
@@ -451,7 +456,7 @@ app: Router = Router(8734, "127.0.0.1")
 app.ASSETS("public", "/assets/*")        # GET /assets/style.css -> public/style.css
 
 app.GET("/", lambda (req: Request, res: Response, ctx: Context) -> None {
-    res.html("<link rel=\"stylesheet\" href=\"/assets/style.css\"><h1>home</h1>")
+    res.html('<link rel="stylesheet" href="/assets/style.css"><h1>home</h1>')
 })
 
 app.listen()
@@ -497,7 +502,7 @@ from http.server import Router, Request, Response, Context
 
 # A sub-router for the API surface.
 api: Router = Router()
-api.GET("/ping",  lambda (req: Request, res: Response, ctx: Context) -> None { res.json("{\"pong\": true}") })
+api.GET("/ping",  lambda (req: Request, res: Response, ctx: Context) -> None { res.json('{"pong": true}') })
 api.POST("/echo", lambda (req: Request, res: Response, ctx: Context) -> None { res.json(req.json()) })
 
 app: Router = Router(8733, "127.0.0.1")

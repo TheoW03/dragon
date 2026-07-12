@@ -1991,7 +1991,20 @@ void CodeGen::visit(IfExpr& node) {
         else if (typeName->name == "bool")  nk = Impl::VarKind::Bool;
         else if (typeName->name == "str")   nk = Impl::VarKind::Str;
         else if (typeName->name == "bytes") nk = Impl::VarKind::List;  // D030 §5: bytes/list share generic-heap dispatch
-        else if (typeName->name == "list")  nk = Impl::VarKind::List;
+        else if (typeName->name == "list") {
+            // Bare-Any list narrowing keeps the box binding (layout unknown:
+            // monomorphized vs box list) - see the IfStmt detectNarrowing.
+            // Gate on a DECLARED list member (an Any param also registers an
+            // entry, so mere presence is not enough).
+            auto membIt = impl_->unionMemberKinds.find(argName->name);
+            bool declaredListMember =
+                membIt != impl_->unionMemberKinds.end() &&
+                std::find(membIt->second.begin(), membIt->second.end(),
+                          Impl::VarKind::List) != membIt->second.end();
+            if (!declaredListMember)
+                return {"", Impl::VarKind::Other};
+            nk = Impl::VarKind::List;
+        }
         else if (typeName->name == "dict")  nk = Impl::VarKind::Dict;
         else if (typeName->name == "tuple") nk = Impl::VarKind::Tuple;
         else if (typeName->name == "set")   nk = Impl::VarKind::Set;

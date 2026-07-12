@@ -761,6 +761,45 @@ DragonBox dragon_box_subscript(DragonBox container, DragonBox index) {
     return {};  // unreachable (typeerror longjmps)
 }
 
+// Defined in the string/dict TUs - declared here for dragon_box_len.
+int64_t dragon_str_len(const char* s);
+int64_t dragon_dict_len(DragonDict* d);
+
+/// len() of a boxed Any value, tag + header dispatched. A TAG_LIST payload
+/// may be EITHER list representation (the monomorphized DragonList family or
+/// a DragonListBox) - all variants share the size field offset, but dispatch
+/// on the header anyway so the layouts stay free to diverge. TAG_BYTES ==
+/// TAG_CLASS, so bytes length is header-gated; a class instance (and every
+/// other unsized value) raises the Python-shaped TypeError.
+int64_t dragon_box_len(DragonBox box) {
+    switch (box.tag) {
+        case TAG_STR:
+            return dragon_str_len((const char*)(uintptr_t)box.payload);
+        case TAG_LIST: {
+            auto* h = (DragonObjectHeader*)(uintptr_t)box.payload;
+            if (!h) break;
+            if (h->type_tag == DRAGON_TAG_LIST_BOX)
+                return ((DragonListBox*)h)->size;
+            return ((DragonList*)h)->size;
+        }
+        case TAG_DICT:
+            return dragon_dict_len((DragonDict*)(uintptr_t)box.payload);
+        case TAG_BYTES: {
+            auto* h = (DragonObjectHeader*)(uintptr_t)box.payload;
+            if (h && h->type_tag == DRAGON_TAG_BYTES)
+                return ((DragonBytes*)h)->len;
+            break;  // class instance -> "has no len()"
+        }
+        default:
+            break;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "TypeError: object of type '%s' has no len()",
+             dragon_box_type_name(box.tag, box.payload));
+    dragon_raise_exc_cstr(80, buf);
+    return 0;  // unreachable (typeerror longjmps)
+}
+
 /// Release an OWNED box temporary: decref its payload by tag (no-op for the
 /// non-refcounted tags int/float/bool/none). Codegen emits this to free an
 /// owned box result (dragon_box_binop / dragon_box_subscript) after a transient
