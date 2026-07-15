@@ -1,0 +1,52 @@
+# Everyday build + test feedback. Runs on every push to main and
+# every PR.
+#
+# LLVM is a released version installed from apt.llvm.org (see
+# .github/actions/setup-llvm), so there is no LLVM build step: the dev package
+# drops in within a minute and only Dragon itself compiles here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# FYI - A newer push to the same branch/PR cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Linux build + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          # zlib/zstd are REQUIRED by Dragon's CMake (find_package/find_library).
+          sudo apt-get install -y cmake ninja-build zlib1g-dev libzstd-dev
+
+      - name: Setup LLVM
+        id: llvm
+        uses: ./.github/actions/setup-llvm
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDRAGON_BUILD_TESTS=ON \
+            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
