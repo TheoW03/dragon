@@ -61,6 +61,53 @@ def gethostbyname(host: str) -> str {
 }
 
 #===----------------------------------------------------------------------===#
+# SocketHandle - the one claim on a kernel socket (docs/1604-ownership)
+#===----------------------------------------------------------------------===#
+
+# A kernel socket is an IDENTITY, not data: exactly one exists, the outside
+# world can see it, and closing it is irreversible. This handle is the single
+# claim on one. Owners hold it as an `own` field, so the ordinary ownership
+# rules forbid a second wrapper over the same claim; close() poisons the
+# descriptor so a second close no-ops and a stale use reads -1 instead of
+# whichever stranger's connection inherited the recycled fd.
+#
+# adopt_raw() is the ONE door in from a bare descriptor - Dragon's spelling
+# of Rust's from_raw_fd. It is public because runtimes, accept loops, and FFI
+# genuinely need it, and greppable because every use is a trust decision:
+# the caller asserts nothing else claims that fd.
+class SocketHandle {
+    _fd: int
+    _closed: bool
+
+    def(fd: int) {
+        self._fd = fd
+        self._closed = False
+    }
+
+    @staticmethod
+    def adopt_raw(fd: int) -> SocketHandle {
+        return SocketHandle(fd)
+    }
+
+    # The live descriptor, or -1 once the claim has been put down.
+    def fd() -> int {
+        if self._closed {
+            return -1
+        }
+        return self._fd
+    }
+
+    # Close the kernel object and poison the handle. Idempotent: the claim
+    # can only be put down once, however many times someone tries.
+    def close() -> None {
+        if not self._closed {
+            self._closed = True
+            close(self._fd)
+        }
+    }
+}
+
+#===----------------------------------------------------------------------===#
 # TcpListener - Server-side TCP socket
 #===----------------------------------------------------------------------===#
 

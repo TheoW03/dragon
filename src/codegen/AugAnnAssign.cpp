@@ -507,11 +507,13 @@ void CodeGen::visit(AugAssignStmt& node) {
         // (ClassName.field via staticFieldGlobals), and heap str/bytes instance
         // fields (concat + storeWithRCOverwrite). Still no-op (todo.md): @property
         // fields (need getter/setter dispatch) and heap-typed static fields.
-        if (auto* objName = dynamic_cast<NameExpr*>(attr->object.get())) {
+        auto* objName = dynamic_cast<NameExpr*>(attr->object.get());
+        {
             // Static class field: `ClassName.field OP= value`. Stored as a module
             // global in staticFieldGlobals (keyed by class name). Numeric only here;
             // heap static fields are rare and fall through (todo).
-            auto sfIt = impl_->staticFieldGlobals.find(objName->name);
+            auto sfIt = objName ? impl_->staticFieldGlobals.find(objName->name)
+                                : impl_->staticFieldGlobals.end();
             if (sfIt != impl_->staticFieldGlobals.end()) {
                 auto gvIt = sfIt->second.find(attr->attribute);
                 if (gvIt != sfIt->second.end()) {
@@ -539,11 +541,16 @@ void CodeGen::visit(AugAssignStmt& node) {
                 }
             }
             std::string className;
-            if (objName->name == "self" && !impl_->currentClassName.empty())
+            if (objName && objName->name == "self" && !impl_->currentClassName.empty())
                 className = impl_->currentClassName;
-            else {
+            else if (objName) {
                 auto vit = impl_->varClassNames.find(objName->name);
                 if (vit != impl_->varClassNames.end()) className = vit->second;
+            } else {
+                // Nested base (`a.b.n += 1`): resolve the base expression's
+                // static class, exactly like the plain-assign path. Without
+                // this the compound store silently no-ops.
+                className = impl_->resolveExprClassName(attr->object.get());
             }
             if (!className.empty()) {
                 auto structIt = impl_->classStructTypes.find(className);

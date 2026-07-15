@@ -552,6 +552,20 @@ public:
     void accept(ASTVisitor& visitor) override;
 };
 
+/// Defer statement: defer f(x) - run a direct call when the current BLOCK
+/// scope exits, on every exit path (fall-through, return, break, continue,
+/// unwind). The other half of the fire coin: fire runs NOW on another green
+/// thread; defer runs LATER on this thread. Arguments and the method receiver
+/// evaluate AT this statement into snapshot slots; only the call runs at
+/// scope exit. `own x` args move at the statement (OwnershipCheck), and a
+/// pending defer pins every binding it references. The operand is always a
+/// CallExpr (the parser rejects anything else).
+class DeferStmt : public Stmt {
+public:
+    std::unique_ptr<Expr> call;
+    void accept(ASTVisitor& visitor) override;
+};
+
 /// Match pattern for match/case (PEP 634)
 struct MatchPattern {
     enum class Kind {
@@ -870,6 +884,7 @@ public:
     virtual void visit(TryStmt& node) = 0;
     virtual void visit(WithStmt& node) = 0;
     virtual void visit(ThreadStmt& node) = 0;
+    virtual void visit(DeferStmt& node) = 0;
     virtual void visit(MatchStmt& node) = 0;
     virtual void visit(ReturnStmt& node) = 0;
     virtual void visit(RaiseStmt& node) = 0;
@@ -946,6 +961,7 @@ public:
     void visit(TryStmt& node) override;
     void visit(WithStmt& node) override;
     void visit(ThreadStmt& node) override;
+    void visit(DeferStmt& node) override;
     void visit(MatchStmt& node) override;
     void visit(ReturnStmt& node) override;
     void visit(RaiseStmt& node) override;
@@ -1024,6 +1040,7 @@ public:
     void visit(TryStmt& node) override;
     void visit(WithStmt& node) override;
     void visit(ThreadStmt& node) override;
+    void visit(DeferStmt& node) override;
     void visit(MatchStmt& node) override;
     void visit(ReturnStmt& node) override;
     void visit(RaiseStmt& node) override;

@@ -596,6 +596,12 @@ std::unique_ptr<Stmt> cloneStmt(const Stmt* s, const TypeSubst& subst) {
         setLoc(r, *s);
         return r;
     }
+    if (auto* n = dynamic_cast<const DeferStmt*>(s)) {
+        auto r = std::make_unique<DeferStmt>();
+        r->call = cloneExpr(n->call.get(), subst);
+        setLoc(r, *s);
+        return r;
+    }
     if (auto* n = dynamic_cast<const MatchStmt*>(s)) {
         auto r = std::make_unique<MatchStmt>();
         r->subject = cloneExpr(n->subject.get(), subst);

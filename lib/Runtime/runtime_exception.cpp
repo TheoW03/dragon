@@ -371,6 +371,18 @@ void dragon_exc_cleanup_unwind(void) {
             case DCLEAN_STR:      dragon_decref_str((const char*)p); break;
             case DCLEAN_CALLABLE: dragon_decref_callable(p); break;
             case DCLEAN_OBJ:      dragon_decref(p); break;
+            case DCLEAN_DEFER_CALL: {
+                // Pending defer: run the thunk over its snapshot values (the
+                // `tag` entries directly below, still on the stack so every
+                // borrowed value is alive). The loop then pops those entries
+                // normally, draining each owned snapshot per its own kind.
+                int32_t argc = cs->tags[i];
+                if (argc >= 0 && i >= argc) {
+                    void (*thunk)(int64_t*) = (void (*)(int64_t*))p;
+                    thunk(&cs->vals[i - argc]);
+                }
+                break;
+            }
             case DCLEAN_UNION: {
                 int32_t tag = cs->tags[i];
                 // Mirror emitUnionDecref: closure (10) before the generic heap

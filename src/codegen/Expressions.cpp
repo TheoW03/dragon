@@ -1267,12 +1267,37 @@ void CodeGen::visit(BinaryExpr& node) {
         if (op == TokenType::EQUAL_EQUAL || op == TokenType::NOT_EQUAL) {
             // One side is ptr (likely a string), the other is i64 (likely a string
             // stored via i64-boxed field). Coerce i64->ptr and call dragon_str_eq.
+            llvm::Value* origL = lhs;
+            llvm::Value* origR = rhs;
             if (lhs->getType() == impl_->i64Type)
                 lhs = impl_->builder->CreateIntToPtr(lhs, impl_->i8PtrType);
             if (rhs->getType() == impl_->i64Type)
                 rhs = impl_->builder->CreateIntToPtr(rhs, impl_->i8PtrType);
             auto* streqResult = impl_->builder->CreateCall(
                 impl_->runtimeFuncs["dragon_str_eq"], {lhs, rhs}, "streq");
+            // Drain owned str temporaries, mirroring the ptr/ptr comparison
+            // path above: a method's str result reaches here i64-shaped
+            // (str returns flow through i64 slots), so `p.peek() == "a"` in
+            // a loop leaked one string per compare. Gates: the expression is
+            // not a borrow (name/attribute/element read), its STATIC type is
+            // str (so decref_str is shape-safe), the value is a call result,
+            // and the callee is not a borrowed-string returner.
+            if (impl_->options.gcMode == GCMode::RC) {
+                auto drainMixed = [&](Expr* e, llvm::Value* orig,
+                                      llvm::Value* coerced) {
+                    if (!e || Impl::isBorrowedHeapExpr(e)) return;
+                    if (!e->type || e->type->kind() != Type::Kind::Str) return;
+                    auto* call = llvm::dyn_cast<llvm::CallInst>(orig);
+                    if (!call) return;
+                    auto* fn = call->getCalledFunction();
+                    if (fn && impl_->isBorrowedStrReturnerName(fn->getName().str()))
+                        return;
+                    impl_->builder->CreateCall(
+                        impl_->runtimeFuncs["dragon_decref_str"], {coerced});
+                };
+                drainMixed(node.left.get(), origL, lhs);
+                drainMixed(node.right.get(), origR, rhs);
+            }
             if (op == TokenType::EQUAL_EQUAL) {
                 impl_->lastValue = impl_->builder->CreateICmpNE(
                     streqResult, llvm::ConstantInt::get(impl_->i64Type, 0));

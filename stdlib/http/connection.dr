@@ -12,6 +12,7 @@
 # present (Content-Length or chunked), de-chunking as needed.
 
 from ssl import SSLSocket
+from socket import SocketHandle
 
 # Binary-safe recv: returns DragonBytes verbatim (no UTF-8 decode), so a body
 # fragmented across reads - or one carrying high bytes mid-UTF-8 - is
@@ -91,7 +92,7 @@ class ConnReader {
     }
 
     # The raw socket fd backing this reader, or -1 if there isn't one. This is
-    # the single seam by which a connection-takeover handler (W2 WebSocket)
+    # the single seam by which a connection-cede handler (W2 WebSocket)
     # reaches the descriptor: after the HTTP upgrade, WebSocket frame I/O is
     # binary and goes straight through the fd (ConnReader.send only carries a
     # str, which can't represent a binary frame). Named socket_fd (NOT fd) so
@@ -107,14 +108,19 @@ class ConnReader {
 # Every recv/send yields the carrier thread on EAGAIN instead of blocking, so a
 # slow client parks this vthread without stalling the scheduler.
 class FdReader(ConnReader) {
-    fd: int
+    # The one claim on this connection's kernel socket (docs/1604-ownership,
+    # "Identity resources"). An own field: a second FdReader over the same
+    # claim is unrepresentable, and dub refuses the class outright. Construct
+    # from a fresh handle (FdReader(SocketHandle.adopt_raw(fd))) or move one
+    # in with `own`.
+    own _sock: SocketHandle
 
-    def(fd: int) {
-        self.fd = fd
+    def(own sock: SocketHandle) {
+        self._sock = sock
     }
 
     def recv(max_len: int) -> bytes {
-        return dragon_nb_recv_bytes(self.fd, max_len)
+        return dragon_nb_recv_bytes(self._sock.fd(), max_len)
     }
 
     # Real timeout-aware read on the live socket (R1). dragon_nb_recv_timeout
@@ -122,21 +128,24 @@ class FdReader(ConnReader) {
     # past timeout_ms the reactor wakes it with an empty result (b"") instead of
     # leaving it blocked forever. timeout_ms <= 0 falls through to a plain read.
     def recv_timeout(max_len: int, timeout_ms: int) -> bytes {
-        return dragon_nb_recv_timeout(self.fd, max_len, timeout_ms)
+        return dragon_nb_recv_timeout(self._sock.fd(), max_len, timeout_ms)
     }
 
     def send(data: str) -> int {
-        return dragon_nb_send(self.fd, data, dragon_str_byte_len_pub(data))
+        return dragon_nb_send(self._sock.fd(), data, dragon_str_byte_len_pub(data))
     }
 
+    # Put the claim down. Idempotent by the handle's poison: every later
+    # recv/send sees fd -1 and fails loudly instead of touching a recycled fd.
     def close() -> None {
-        dragon_close_fd(self.fd)
+        self._sock.close()
     }
 
-    # Expose the underlying socket fd for connection takeover (W2). After a
+    # Expose the underlying socket fd for connection cede (W2). After a
     # WebSocket upgrade the handler does binary frame I/O directly on this fd.
+    # Returns -1 once the claim is closed, which the upgrade path rejects.
     def socket_fd() -> int {
-        return self.fd
+        return self._sock.fd()
     }
 }
 

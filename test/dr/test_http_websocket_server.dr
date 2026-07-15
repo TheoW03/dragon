@@ -20,7 +20,7 @@ from http.server import ConnReader, FdReader, MemoryReader
 from http.websocket import WebSocket
 from http.websocket import build_frame, parse_frame, frame_length, Frame
 from http.websocket import IncompleteFrameError
-from socket import TcpListener, TcpStream
+from socket import TcpListener, TcpStream, SocketHandle
 
 # Opcodes (RFC 6455 §5.2) - hardcoded here so the client side doesn't depend on
 # websocket.dr's internal const visibility.
@@ -72,7 +72,7 @@ def _ws_accept_serve(lis: TcpListener, app: Router, n: int, fds: list[int]) -> N
     while i < n {
         const conn: TcpStream = lis.do_accept()
         fds.append(conn.fd)
-        const reader: ConnReader = FdReader(conn.fd)
+        const reader: ConnReader = FdReader(SocketHandle.adopt_raw(conn.fd))
         app.serve_connection(reader)
         i = i + 1
     }

@@ -110,6 +110,13 @@ block. Writing your own is the same two methods shown here.
 | Bind the entered value | `with R() as r { ... }` - `r` is what `__enter__` returns |
 | Guarantee cleanup | put it in `__exit__` - it runs on success *and* on `raise` |
 | Handle an error from the block | wrap the `with` in `try`/`except` (no suppression in `__exit__` yet) |
+| An exit with no matching enter | `defer f(x)` - a one-off scope-exit call, no protocol needed ([Defer](/docs/1105-defer)) |
+
+`with` is for enter/exit PAIRS a type defines once. When the cleanup is a
+one-off - close this, log that, hand this connection to its new owner - and
+there is no protocol to name, reach for [`defer`](/docs/1105-defer) instead. A
+`defer` registered inside a `with` body runs before `__exit__`, innermost
+first, exactly as if you had written the call at the closing brace.
 
 That closes Part 9. With exceptions, custom error types, and guaranteed cleanup in
 hand, the next part returns to data - [Modules and Packages](/docs/1001-modules) and

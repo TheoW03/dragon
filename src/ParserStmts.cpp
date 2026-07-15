@@ -102,6 +102,16 @@ std::unique_ptr<Stmt> Parser::statement() {
         return ownDeclaration();
     }
 
+    // Contextual keyword: `defer f(...)` scope-exit call (the other half of
+    // the fire coin). Two consecutive identifiers cannot start any other
+    // statement, so one-token lookahead disambiguates and code using `defer`
+    // as a name (the http router's defer method) keeps compiling.
+    if (impl_->options.isDragonFile &&
+        check(TokenType::IDENTIFIER) && current().lexeme() == "defer" &&
+        peekNext().type() == TokenType::IDENTIFIER) {
+        return deferStatement();
+    }
+
     // Dragon-specific keywords (.dr mode only)
     if (impl_->options.isDragonFile && check(TokenType::EXTERN)) {
         return externDeclaration();
@@ -379,6 +389,23 @@ std::unique_ptr<Stmt> Parser::nonlocalStatement() {
     do {
         stmt->names.push_back(std::string(consume(TokenType::IDENTIFIER, "Expect variable name").lexeme()));
     } while (match(TokenType::COMMA));
+    return stmt;
+}
+
+// defer <call>: schedule a direct call for scope exit. The operand must BE a
+// call - a function, method, or bound-closure call. A deferred call's return
+// value is discarded, so deferring anything value-shaped (a bare name,
+// arithmetic over calls) is rejected here, not later.
+std::unique_ptr<Stmt> Parser::deferStatement() {
+    Token kw = advance();  // the 'defer' identifier
+    auto stmt = std::make_unique<DeferStmt>();
+    stmt->setLocation(kw.location());
+    auto operand = expression();
+    if (!dynamic_cast<CallExpr*>(operand.get())) {
+        error(kw, "'defer' requires a direct call: a function call, method "
+                  "call, or bound-closure call");
+    }
+    stmt->call = std::move(operand);
     return stmt;
 }
 

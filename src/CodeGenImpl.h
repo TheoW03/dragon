@@ -115,6 +115,23 @@ struct CodeGen::Impl {
         // re-free locals already decref'd here).
         std::unordered_map<std::string, llvm::AllocaInst*> cleanupSlots;
         llvm::AllocaInst* cleanupBaseAlloca = nullptr;
+        // defer f(x) snapshots (defer.md): appended by visit(DeferStmt) in
+        // source order; emitScopeCleanupFor calls them in REVERSE (LIFO)
+        // ahead of the RC decref pass on every exit edge, so borrowed
+        // snapshots are alive at call time. argSlots is an [argc x i64]
+        // entry alloca holding the snapshot values (written at the defer
+        // statement). drainKinds[i] != VarKind::Other means slot i owns a +1
+        // released after the deferred call runs; a value an own param adopts
+        // carries VarKind::Other (the callee consumed it). The straight-line
+        // append order also gives exit edges emitted mid-scope exactly the
+        // defers whose statements precede them - registration is lexical.
+        struct DeferEntry {
+            llvm::Function* thunk = nullptr;      // void(i64*) per-site
+            llvm::AllocaInst* argSlots = nullptr; // [max(argc,1) x i64]
+            unsigned argc = 0;
+            std::vector<VarKind> drainKinds;
+        };
+        std::vector<DeferEntry> deferred;
     };
     std::vector<Scope> scopes;
 
@@ -246,6 +263,11 @@ struct CodeGen::Impl {
         std::vector<Stmt*> finallyBody;          // isWith == false (owned by TryStmt)
         std::vector<WithCleanupItem> withItems;  // isWith == true
         llvm::Function* func = nullptr;          // owning function (depth isolation)
+        // scopes.size() when this entry was pushed. Early exits interleave
+        // exit-cleanup replays with per-scope cleanup by nesting depth
+        // (emitEarlyExitCleanups), so a defer registered INSIDE a try body
+        // runs before that try's finally, matching the normal-exit order.
+        size_t scopeDepth = 0;
     };
     std::vector<ExitCleanup> exitCleanupStack;
 
@@ -1261,6 +1283,12 @@ struct CodeGen::Impl {
     /// literals, alloca loads of named vars) are not owned intermediates.
     bool isOwnedStrResult(llvm::Value* v);
 
+    /// True when a NAMED callee returns a BORROWED string (TLS slots,
+    /// container element reads, foreign C pointers) that must never be
+    /// decref'd by the consumer. Shared by isOwnedStrResult and the
+    /// mixed-shape comparison drain in Expressions.cpp.
+    bool isBorrowedStrReturnerName(const std::string& name);
+
     /// Generic-pointer analog of isOwnedStrResult: true if `v` is an owned
     /// (+1, fresh) heap object pointer - list/dict/set/tuple/instance/bytes -
     /// that a consumer must release or take ownership of. Same blocklist
@@ -1446,6 +1474,11 @@ struct CodeGen::Impl {
     static constexpr int DCLEAN_CALLABLE = 2;
     static constexpr int DCLEAN_OBJ      = 3;
     static constexpr int DCLEAN_UNION    = 4;
+    // A pending defer's call entry: val is the void(i64*) thunk, tag is the
+    // arg count. The unwinder invokes the thunk over the `tag` entries pushed
+    // directly below it (each carrying its own DCLEAN kind for the post-call
+    // release), then keeps popping so those entries drain normally.
+    static constexpr int DCLEAN_DEFER_CALL = 5;
 
     /// Map an owned-heap VarKind to its DragonCleanupKind, mirroring
     /// emitScopeCleanupFor's per-kind decref dispatch. Returns 0 for non-heap
@@ -1602,40 +1635,60 @@ struct CodeGen::Impl {
         }
     }
 
-    /// Replay exit cleanups from the top of the stack down to (not including)
-    /// `downTo`, innermost first (the push order is lexical, innermost last).
-    /// A finally entry inlines its body; a with entry calls __exit__ / releases
-    /// locks for its context managers. Used by return/break/continue so every
-    /// early exit runs the same finally + __exit__/release the normal and
-    /// exception paths run. `downTo` bounds the replay: a return passes its
-    /// function base (skip enclosing functions); break/continue pass the loop's
-    /// recorded depth (skip cleanups enclosing the loop). Stops if a replayed
-    /// body terminates the block (e.g. a finally that returns/raises).
-    void emitInlineExitCleanups(CodeGen& cg, size_t downTo) {
-        for (size_t i = exitCleanupStack.size(); i > downTo; --i) {
-            auto* bb = builder->GetInsertBlock();
-            if (!bb || bb->getTerminator()) return;
-            auto& e = exitCleanupStack[i - 1];
-            if (!e.isWith) {
-                for (auto* stmt : e.finallyBody) stmt->accept(cg);
-            } else {
-                // Forward order, matching the with-statement's normal cleanup path.
-                for (auto& it : e.withItems) {
-                    if (it.isClassCtx) {
-                        callDunder(it.className, "__exit__", it.val);
-                        if (options.gcMode == GCMode::RC) {   // release the CM object (#8)
-                            if (it.subjectOwned)
-                                builder->CreateCall(runtimeFuncs["dragon_decref"], {it.val});
-                            if (it.enterResult && it.enterResult->getType()->isPointerTy())
-                                builder->CreateCall(runtimeFuncs["dragon_decref"], {it.enterResult});
-                        }
-                    } else if (it.isLock) {
-                        builder->CreateCall(runtimeFuncs["dragon_lock_release"], {it.val});
-                        if (it.isLockTemp)  // anonymous `with Lock()` - free the mutex
-                            builder->CreateCall(runtimeFuncs["dragon_lock_destroy"], {it.val});
+    /// Replay one exit-cleanup entry (a finally body or a with's __exit__ /
+    /// lock-release set), used by the depth-interleaved early-exit walk below.
+    void replayExitCleanup(CodeGen& cg, ExitCleanup& e) {
+        if (!e.isWith) {
+            for (auto* stmt : e.finallyBody) stmt->accept(cg);
+        } else {
+            // Forward order, matching the with-statement's normal cleanup path.
+            for (auto& it : e.withItems) {
+                if (it.isClassCtx) {
+                    callDunder(it.className, "__exit__", it.val);
+                    if (options.gcMode == GCMode::RC) {   // release the CM object (#8)
+                        if (it.subjectOwned)
+                            builder->CreateCall(runtimeFuncs["dragon_decref"], {it.val});
+                        if (it.enterResult && it.enterResult->getType()->isPointerTy())
+                            builder->CreateCall(runtimeFuncs["dragon_decref"], {it.enterResult});
                     }
+                } else if (it.isLock) {
+                    builder->CreateCall(runtimeFuncs["dragon_lock_release"], {it.val});
+                    if (it.isLockTemp)  // anonymous `with Lock()` - free the mutex
+                        builder->CreateCall(runtimeFuncs["dragon_lock_destroy"], {it.val});
                 }
             }
+        }
+    }
+
+    /// Early-exit (return/break/continue) cleanup: walk scopes innermost to
+    /// `targetScopeDepth` and exit-cleanup entries down to `ecDownTo`,
+    /// INTERLEAVED by nesting depth - each scope's defers + decrefs run
+    /// before the finally/__exit__ that encloses that scope, exactly as they
+    /// would on the normal fall-through path. Replaces the old two-flat-pass
+    /// order (all finallys, then all scopes), which ran an enclosing finally
+    /// before an inner scope's deferred calls.
+    void emitEarlyExitCleanups(CodeGen& cg, size_t targetScopeDepth,
+                               size_t ecDownTo) {
+        size_t ecIdx = exitCleanupStack.size();
+        auto blocked = [&]() {
+            auto* bb = builder->GetInsertBlock();
+            return !bb || bb->getTerminator();
+        };
+        const bool rc = options.gcMode == GCMode::RC;
+        for (size_t depth = scopes.size(); depth > targetScopeDepth; --depth) {
+            while (ecIdx > ecDownTo &&
+                   exitCleanupStack[ecIdx - 1].scopeDepth >= depth) {
+                if (blocked()) return;
+                --ecIdx;
+                replayExitCleanup(cg, exitCleanupStack[ecIdx]);
+            }
+            if (blocked()) return;
+            if (rc) emitScopeCleanupFor(scopes[depth - 1]);
+        }
+        while (ecIdx > ecDownTo) {
+            if (blocked()) return;
+            --ecIdx;
+            replayExitCleanup(cg, exitCleanupStack[ecIdx]);
         }
     }
 
@@ -1714,6 +1767,24 @@ struct CodeGen::Impl {
     // false on a diagnosed error (lastValue poisoned). Defined in CallExpr.cpp.
     bool expandSpreadCallArgs(
         CodeGen& cg, llvm::Function* func, CallExpr& node,
+        std::vector<llvm::Value*>& args,
+        std::vector<std::pair<llvm::Value*, VarKind>>& argTemps,
+        const std::string& dispName);
+
+    // Pack a variadic method call's surplus positionals into a `*args` list and
+    // surplus keywords into a `**kwargs` dict, given `self` already pushed as
+    // args[0] (empty for a static variadic method). The method-path twin of the
+    // free-function emitVarArgCall, differing only by the leading-self offset:
+    // funcParamNames includes "self" at index 0 for an instance method, while
+    // VarArgInfo.numRegularParams counts only the user params before `*args`.
+    // The packed list/dict are call-site-owned temporaries registered in
+    // `argTemps` so the shared call tail drains them (the callee borrows).
+    // Returns true when `args` is fully built (caller emits the call), false
+    // after emitting a diagnostic (caller returns, lastValue poisoned). Defined
+    // in CallMethods.cpp.
+    bool packVarArgMethodArgs(
+        CodeGen& cg, CallExpr& node, const std::string& methodFuncName,
+        llvm::FunctionType* methodFuncType,
         std::vector<llvm::Value*>& args,
         std::vector<std::pair<llvm::Value*, VarKind>>& argTemps,
         const std::string& dispName);
@@ -1936,7 +2007,16 @@ struct CodeGen::Impl {
         if (options.gcMode != GCMode::RC || !value) return;
         auto* nm = dynamic_cast<NameExpr*>(value);
         if (!nm || !nm->isMoveMarked) return;
-        if (auto* alloca = lookupVar(nm->name)) emitNullSlot(alloca);
+        if (auto* alloca = lookupVar(nm->name)) {
+            emitNullSlot(alloca);
+            // Same unwind-snapshot neutralization as emitMoveOutSlots: the
+            // adopter owns the +1 now, the cleanup stack must not re-free it.
+            emitCleanupUpdate(
+                nm->name,
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(i8PtrType)),
+                nullptr);
+        }
     }
 
     void emitMoveOutSlots(CallExpr& node) {
@@ -1944,7 +2024,17 @@ struct CodeGen::Impl {
         for (auto& a : node.args) {
             auto* nm = dynamic_cast<NameExpr*>(a.get());
             if (!nm || !nm->isMoveMarked) continue;
-            if (auto* alloca = lookupVar(nm->name)) emitNullSlot(alloca);
+            if (auto* alloca = lookupVar(nm->name)) {
+                emitNullSlot(alloca);
+                // The unwind cleanup stack snapshots the value at declaration;
+                // the callee adopted that +1, so a later longjmp unwind must
+                // see null here, not re-free what the callee now owns.
+                emitCleanupUpdate(
+                    nm->name,
+                    llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(i8PtrType)),
+                    nullptr);
+            }
         }
     }
 
@@ -2998,6 +3088,20 @@ struct CodeGen::Impl {
         llvm::StructType* argsStructType,
         const std::vector<VarKind>& argKinds,
         const std::string& siteName);
+
+    /// Build a per-defer-site thunk `void __dragon_defer_<site>(i64* args)`
+    /// that loads targetFn's arguments from the i64 snapshot array (inttoptr /
+    /// trunc / bitcast per param type), calls it, and discards the result.
+    /// One thunk serves BOTH exit paths: emitScopeCleanupFor calls it inline
+    /// on normal exits, and dragon_exc_cleanup_unwind calls it through the
+    /// DCLEAN_DEFER_CALL entry during a longjmp unwind. Defined next to
+    /// buildFireTrampoline in ImplMethods2.cpp.
+    /// vtableIndex >= 0 dispatches the call through the receiver's vtable
+    /// (D026 parity: an overridden method deferred on a base-typed receiver
+    /// must reach the subclass override, exactly like the direct call).
+    llvm::Function* buildDeferThunk(llvm::Function* targetFn,
+                                    const std::string& siteName,
+                                    int vtableIndex = -1);
 
     /// Build a per-callsite generator trampoline that:
     ///  1. Pulls the args struct out of user_data

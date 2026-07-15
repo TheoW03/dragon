@@ -1197,8 +1197,12 @@ void CodeGen::visit(ClassDecl& node) {
             impl_->builder->CreateStore(&*argIt, alloca);
             auto paramKind = impl_->typeExprToKind(decl->params[i].type.get());
             impl_->setVar(pname, alloca, paramKind);
-            // GC: mark params as borrowed - caller owns the reference
-            if (Impl::isHeapKind(paramKind))
+            // GC: mark params as borrowed unless `own` - an `own` ctor param is
+            // moved in; when the body moves it into an own field the slot is
+            // nulled (scope-exit free is a no-op), and when it is only consumed
+            // the scope exit releases it instead of leaking (mirrors methods /
+            // free functions; ASan A/B-proven on the consumed-not-stored case).
+            if (Impl::isHeapKind(paramKind) && !decl->params[i].isOwn)
                 impl_->scopes.back().borrowed.insert(pname);
             // Track class-typed params for field access (e.g. other.x in dunders)
             if (auto* namedType = dynamic_cast<NamedTypeExpr*>(decl->params[i].type.get())) {
@@ -2233,25 +2237,58 @@ void CodeGen::visit(ClassDecl& node) {
             size_t paramStart = methodDecl->isClassMethod ? 1 : 0;
             unsigned argIdx = 0;
             for (size_t i = paramStart; i < methodDecl->params.size(); ++i) {
-                std::string pname = methodDecl->params[i].name;
+                const auto& mp = methodDecl->params[i];
+                if (mp.isVarArg && mp.name.empty()) continue;  // bare * separator
+                std::string pname = mp.name;
                 argIt->setName(pname);
                 auto* alloca = impl_->createEntryAlloca(methodFunc, pname, methodFuncType->getParamType(argIdx));
                 impl_->builder->CreateStore(&*argIt, alloca);
-                auto paramKind = impl_->typeExprToKind(methodDecl->params[i].type.get());
+                if (mp.isVarArg) {
+                    // *args: the packed monomorphized list[T] (see instance path).
+                    impl_->setVar(pname, alloca, Impl::VarKind::List);
+                    impl_->scopes.back().borrowed.insert(pname);
+                    if (TypeExpr* elemTy = mp.type.get()) {
+                        Impl::VarKind ek = impl_->typeExprToKind(elemTy);
+                        impl_->varListElemKinds[pname] =
+                            Impl::elemVarKindToTypeKind(ek);
+                        if (ek == Impl::VarKind::Type)
+                            impl_->varListElemIsType.insert(pname);
+                        if (auto* nt = dynamic_cast<NamedTypeExpr*>(elemTy)) {
+                            if (impl_->classNames.count(nt->name) ||
+                                impl_->classFieldKinds.count(nt->name))
+                                impl_->varListElemClassName[pname] = nt->name;
+                        }
+                    }
+                    ++argIt; ++argIdx;
+                    continue;
+                }
+                if (mp.isKwArg) {
+                    // **kwargs: the packed dict[str, V].
+                    impl_->setVar(pname, alloca, Impl::VarKind::Dict);
+                    impl_->scopes.back().borrowed.insert(pname);
+                    impl_->varDictKeyKinds[pname] = Type::Kind::Str;
+                    impl_->varDictValueKinds[pname] = Impl::elemVarKindToTypeKind(
+                        impl_->typeExprToKind(mp.type.get()));
+                    ++argIt; ++argIdx;
+                    continue;
+                }
+                auto paramKind = impl_->typeExprToKind(mp.type.get());
                 impl_->setVar(pname, alloca, paramKind);
                 // Track union member kinds so isinstance else-narrowing of a
                 // union param resolves the complement arm (see save/clear above).
                 if (paramKind == Impl::VarKind::Union)
                     impl_->unionMemberKinds[pname] =
-                        impl_->typeExprToUnionMembers(methodDecl->params[i].type.get());
-                // GC: mark params as borrowed - caller owns the reference
-                if (Impl::isHeapKind(paramKind))
+                        impl_->typeExprToUnionMembers(mp.type.get());
+                // GC: mark params as borrowed unless `own` (see the instance
+                // path below) - an `own` param is moved in and the callee's
+                // scope exit releases it if the body did not move it onward.
+                if (Impl::isHeapKind(paramKind) && !mp.isOwn)
                     impl_->scopes.back().borrowed.insert(pname);
                 // Register Callable / ptr signature so calls through the param
                 // resolve to the right LLVM function type (no `: ptr` workaround).
-                impl_->trackPtrParam(pname, methodDecl->params[i].type.get());
+                impl_->trackPtrParam(pname, mp.type.get());
                 // Track class-typed params for field access
-                if (auto* namedType = dynamic_cast<NamedTypeExpr*>(methodDecl->params[i].type.get())) {
+                if (auto* namedType = dynamic_cast<NamedTypeExpr*>(mp.type.get())) {
                     if (impl_->classNames.count(namedType->name))
                         impl_->varClassNames[pname] = namedType->name;
                 }
@@ -2268,33 +2305,79 @@ void CodeGen::visit(ClassDecl& node) {
             impl_->scopes.back().borrowed.insert("self");
             ++argIt;
 
-            // Remaining params
+            // Remaining params. A `*args`/`**kwargs` param is bound as a
+            // list/dict local exactly like the free-function prologue
+            // (Functions.cpp) - the callee receives one already-packed pointer.
+            // The bare `*` keyword-only separator has no LLVM param and is
+            // skipped. argIdx tracks the LLVM parameter position (self is 0) and
+            // advances only for real params, so a skipped bare `*` can't
+            // desynchronize it from argIt.
             size_t paramStart = methodDecl->hasImplicitSelf ? 0 : 1;
+            unsigned argIdx = 1;  // after self
             for (size_t i = paramStart; i < methodDecl->params.size(); ++i) {
-                std::string pname = methodDecl->params[i].name;
+                const auto& mp = methodDecl->params[i];
+                if (mp.isVarArg && mp.name.empty()) continue;  // bare * separator
+                std::string pname = mp.name;
                 argIt->setName(pname);
-                unsigned argIdx = 1 + (unsigned)(i - paramStart);
-                auto* alloca = impl_->createEntryAlloca(methodFunc, pname, methodFuncType->getParamType(argIdx));
+                auto* alloca = impl_->createEntryAlloca(
+                    methodFunc, pname, methodFuncType->getParamType(argIdx));
                 impl_->builder->CreateStore(&*argIt, alloca);
-                auto paramKind = impl_->typeExprToKind(methodDecl->params[i].type.get());
+                if (mp.isVarArg) {
+                    // *args: the packed monomorphized list[T]. Register the
+                    // element kind so `for x in args` / `args[i]` read native T.
+                    impl_->setVar(pname, alloca, Impl::VarKind::List);
+                    impl_->scopes.back().borrowed.insert(pname);
+                    if (TypeExpr* elemTy = mp.type.get()) {
+                        Impl::VarKind ek = impl_->typeExprToKind(elemTy);
+                        impl_->varListElemKinds[pname] =
+                            Impl::elemVarKindToTypeKind(ek);
+                        if (ek == Impl::VarKind::Type)
+                            impl_->varListElemIsType.insert(pname);
+                        if (auto* nt = dynamic_cast<NamedTypeExpr*>(elemTy)) {
+                            if (impl_->classNames.count(nt->name) ||
+                                impl_->classFieldKinds.count(nt->name))
+                                impl_->varListElemClassName[pname] = nt->name;
+                        }
+                    }
+                    ++argIt; ++argIdx;
+                    continue;
+                }
+                if (mp.isKwArg) {
+                    // **kwargs: the packed dict[str, V]. Keys are always str;
+                    // the annotation is the per-VALUE type.
+                    impl_->setVar(pname, alloca, Impl::VarKind::Dict);
+                    impl_->scopes.back().borrowed.insert(pname);
+                    impl_->varDictKeyKinds[pname] = Type::Kind::Str;
+                    impl_->varDictValueKinds[pname] = Impl::elemVarKindToTypeKind(
+                        impl_->typeExprToKind(mp.type.get()));
+                    ++argIt; ++argIdx;
+                    continue;
+                }
+                auto paramKind = impl_->typeExprToKind(mp.type.get());
                 impl_->setVar(pname, alloca, paramKind);
                 // Track union member kinds so isinstance else-narrowing of a
                 // union param resolves the complement arm (see save/clear above).
                 if (paramKind == Impl::VarKind::Union)
                     impl_->unionMemberKinds[pname] =
-                        impl_->typeExprToUnionMembers(methodDecl->params[i].type.get());
-                // GC: mark params as borrowed - caller owns the reference
-                if (Impl::isHeapKind(paramKind))
+                        impl_->typeExprToUnionMembers(mp.type.get());
+                // GC: mark params as borrowed - the caller owns the reference. An
+                // `own` param is the exception (docs/002 2.8): the caller MOVED
+                // its +1 in, so this callee owns it and scope exit releases it
+                // (unless the body moved it onward, which nulls the slot). This
+                // mirrors the free-function prologue (Functions.cpp); without the
+                // `!isOwn` guard an `own` method param consumed but not stored
+                // leaked one value per call (ASan A/B-proven).
+                if (Impl::isHeapKind(paramKind) && !mp.isOwn)
                     impl_->scopes.back().borrowed.insert(pname);
                 // Register Callable / ptr signature so calls through the param
                 // resolve to the right LLVM function type (no `: ptr` workaround).
-                impl_->trackPtrParam(pname, methodDecl->params[i].type.get());
+                impl_->trackPtrParam(pname, mp.type.get());
                 // Track class-typed params for field access (e.g. other.x in dunders)
-                if (auto* namedType = dynamic_cast<NamedTypeExpr*>(methodDecl->params[i].type.get())) {
+                if (auto* namedType = dynamic_cast<NamedTypeExpr*>(mp.type.get())) {
                     if (impl_->classNames.count(namedType->name))
                         impl_->varClassNames[pname] = namedType->name;
                 }
-                ++argIt;
+                ++argIt; ++argIdx;
             }
         }
 

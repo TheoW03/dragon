@@ -389,3 +389,22 @@ TEST(SemaTest, MatchCaptureInOrSubPattern) {
         "}\n"
     ));
 }
+
+//===----------------------------------------------------------------------===//
+// defer placement: no defer at module top level (no scope to end before
+// process exit), same family as 'return' outside function.
+//===----------------------------------------------------------------------===//
+
+TEST(SemaTest, ModuleLevelDeferRejected) {
+    EXPECT_TRUE(analyzeHasErrors(
+        "def f() -> None { pass }\n"
+        "defer f()\n"));
+}
+
+TEST(SemaTest, DeferInsideFunctionAccepted) {
+    EXPECT_TRUE(analyzeOk(
+        "def f() -> None { pass }\n"
+        "def g() -> None {\n"
+        "    defer f()\n"
+        "}\n"));
+}

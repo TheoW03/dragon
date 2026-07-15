@@ -430,7 +430,7 @@ TEST(OwnershipCheckTest, DubImmutableIterableErrors) {
 TEST(OwnershipCheckTest, TouchWhileLentErrors) {
     std::string e = ownError(
         "class Op { name: str\n def(n: str) { self.name = n } }\n"
-        "def work(o: Op) -> int { return len(o.name) }\n"
+        "def work(o: Op) -> int { o.name = \"x\"\n return len(o.name) }\n"
         "def f() -> int {\n"
         "    o: Op = Op(\"inc\")\n"
         "    t: Task[int] = fire work(o)\n"
@@ -444,7 +444,7 @@ TEST(OwnershipCheckTest, TouchWhileLentErrors) {
 TEST(OwnershipCheckTest, DiscardedHandleBorrowErrors) {
     std::string e = ownError(
         "class Op { name: str\n def(n: str) { self.name = n } }\n"
-        "def work(o: Op) -> int { return len(o.name) }\n"
+        "def work(o: Op) -> int { o.name = \"x\"\n return len(o.name) }\n"
         "def f() {\n"
         "    o: Op = Op(\"inc\")\n"
         "    fire work(o)\n"
@@ -456,7 +456,7 @@ TEST(OwnershipCheckTest, DiscardedHandleBorrowErrors) {
 TEST(OwnershipCheckTest, StillLentAtScopeEndErrors) {
     std::string e = ownError(
         "class Op { name: str\n def(n: str) { self.name = n } }\n"
-        "def work(o: Op) -> int { return len(o.name) }\n"
+        "def work(o: Op) -> int { o.name = \"x\"\n return len(o.name) }\n"
         "def f() {\n"
         "    o: Op = Op(\"inc\")\n"
         "    t: Task[int] = fire work(o)\n"
@@ -467,7 +467,7 @@ TEST(OwnershipCheckTest, StillLentAtScopeEndErrors) {
 TEST(OwnershipCheckTest, TaskRebindWhileLentErrors) {
     std::string e = ownError(
         "class Op { name: str\n def(n: str) { self.name = n } }\n"
-        "def work(o: Op) -> int { return len(o.name) }\n"
+        "def work(o: Op) -> int { o.name = \"x\"\n return len(o.name) }\n"
         "def f() -> int {\n"
         "    o: Op = Op(\"inc\")\n"
         "    t: Task[int] = fire work(o)\n"
@@ -486,5 +486,202 @@ TEST(OwnershipCheckTest, LendThenAwaitThenUseCompiles) {
         "    t: Task[int] = fire work(o)\n"
         "    const r: int = await t\n"
         "    return r + len(o.name)\n"
+        "}\n"));
+}
+
+//===----------------------------------------------------------------------===//
+// ADR 2.9 door 5 - read-only shared borrow across `fire`.
+// A plain `fire worker(shared)` that COMPILES proves `worker` only reads its
+// parameter; a mutating worker misses the door and keeps the lend/E12 rules.
+//===----------------------------------------------------------------------===//
+
+// The worker-pool fan-out: one task per worker over the SAME shared list,
+// joined after the loop. Read-only worker -> door 5 accepts (pre-door this was
+// E10 on the loop back edge).
+TEST(OwnershipCheckTest, FireReadOnlyListFanOutAccepted) {
+    EXPECT_TRUE(ownAccepts(
+        "def worker(s: list[str]) -> int {\n"
+        "    n: int = 0\n"
+        "    i: int = 0\n"
+        "    while i < len(s) {\n"
+        "        n = n + len(s[i])\n"
+        "        i = i + 1\n"
+        "    }\n"
+        "    return n\n"
+        "}\n"
+        "def run() -> int {\n"
+        "    shared: list[str] = [\"a\", \"b\"]\n"
+        "    tasks: list[Task[int]] = []\n"
+        "    w: int = 0\n"
+        "    while w < 4 {\n"
+        "        t: Task[int] = fire worker(shared)\n"
+        "        tasks.append(t)\n"
+        "        w = w + 1\n"
+        "    }\n"
+        "    total: int = 0\n"
+        "    for t in tasks { total = total + t.join() }\n"
+        "    return total\n"
+        "}\n"));
+}
+
+// A discarded handle firing a read-only worker is also fine: the worker holds
+// its own atomic-RC reference, so the value cannot dangle.
+TEST(OwnershipCheckTest, FireReadOnlyDiscardedHandleAccepted) {
+    EXPECT_TRUE(ownAccepts(
+        "def worker(s: list[str]) -> int { return len(s) }\n"
+        "def run() -> None {\n"
+        "    shared: list[str] = [\"a\", \"b\"]\n"
+        "    fire worker(shared)\n"
+        "}\n"));
+}
+
+// The door is READ-ONLY: a worker that appends to its parameter mutates shared
+// state. Fired in a loop it must still be refused (it never reaches door 5, so
+// the loop back-edge lend kills it) - dub/own is the answer.
+TEST(OwnershipCheckTest, FireMutatingWorkerInLoopRejected) {
+    std::string e = ownError(
+        "def mutate(s: list[int]) -> int {\n"
+        "    s.append(1)\n"
+        "    return len(s)\n"
+        "}\n"
+        "def run() -> int {\n"
+        "    shared: list[int] = [1, 2, 3]\n"
+        "    tasks: list[Task[int]] = []\n"
+        "    w: int = 0\n"
+        "    while w < 4 {\n"
+        "        t: Task[int] = fire mutate(shared)\n"
+        "        tasks.append(t)\n"
+        "        w = w + 1\n"
+        "    }\n"
+        "    return len(tasks)\n"
+        "}\n");
+    EXPECT_FALSE(e.empty()) << "mutating worker fan-out must be refused";
+}
+
+// A read-only share ESCAPES: the value cannot be `del`'d while a thread may
+// still be reading it. This must be refused even though the worker is read-only.
+TEST(OwnershipCheckTest, DelAfterReadOnlyShareRejected) {
+    std::string e = ownError(
+        "def worker(s: list[str]) -> int { return len(s) }\n"
+        "def run() -> int {\n"
+        "    shared: list[str] = [\"a\", \"b\"]\n"
+        "    t: Task[int] = fire worker(shared)\n"
+        "    del shared\n"
+        "    return t.join()\n"
+        "}\n");
+    EXPECT_FALSE(e.empty()) << "del of a value shared into a thread must refuse";
+}
+
+//===----------------------------------------------------------------------===//
+// defer: scope-exit calls with ownership. `defer f(own x)` moves x at the
+// STATEMENT; any later use is the same E-class as use-after-move. A pending
+// defer PINS every binding it references (args and receiver): a later own
+// move or del of a pinned binding would leave the defer holding a value
+// somebody else now owns, so it must refuse at compile time.
+//===----------------------------------------------------------------------===//
+
+TEST(OwnershipCheckTest, UseAfterDeferOwnMoveErrors) {
+    std::string e = ownError(
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> int {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer sink(own d)\n"
+        "    return len(d)\n"
+        "}\n");
+    EXPECT_NE(e.find("was moved into"), std::string::npos) << e;
+}
+
+TEST(OwnershipCheckTest, DoubleMoveAfterDeferOwnErrors) {
+    std::string e = ownError(
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer sink(own d)\n"
+        "    sink(own d)\n"
+        "}\n");
+    EXPECT_FALSE(e.empty()) << "second move of a defer-moved binding must refuse";
+}
+
+TEST(OwnershipCheckTest, OwnMoveOfDeferPinnedArgErrors) {
+    std::string e = ownError(
+        "def use(d: list[int]) -> None { }\n"
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer use(d)\n"
+        "    sink(own d)\n"
+        "}\n");
+    EXPECT_NE(e.find("pending defer"), std::string::npos) << e;
+}
+
+TEST(OwnershipCheckTest, OwnMoveOfDeferredReceiverErrors) {
+    std::string e = ownError(
+        "class R {\n"
+        "    def() { }\n"
+        "    def close() -> None { }\n"
+        "}\n"
+        "def sink(own r: R) -> None { }\n"
+        "def f() -> None {\n"
+        "    r: R = R()\n"
+        "    defer r.close()\n"
+        "    sink(own r)\n"
+        "}\n");
+    EXPECT_NE(e.find("pending defer"), std::string::npos) << e;
+}
+
+TEST(OwnershipCheckTest, DelOfDeferPinnedBindingErrors) {
+    std::string e = ownError(
+        "def use(d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer use(d)\n"
+        "    del d\n"
+        "}\n");
+    EXPECT_NE(e.find("pending defer"), std::string::npos) << e;
+}
+
+// The pin dies with the defer's scope: after the block exits, the defer has
+// already run and the binding is movable again.
+TEST(OwnershipCheckTest, PinExpiresWithDeferScope) {
+    EXPECT_TRUE(ownAccepts(
+        "def use(d: list[int]) -> None { }\n"
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f(flag: bool) -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    if flag {\n"
+        "        defer use(d)\n"
+        "    }\n"
+        "    sink(own d)\n"
+        "}\n"));
+}
+
+TEST(OwnershipCheckTest, DeferBorrowThenContinuedUseAccepted) {
+    EXPECT_TRUE(ownAccepts(
+        "def use(d: list[int]) -> None { }\n"
+        "def f() -> int {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer use(d)\n"
+        "    d.append(3)\n"
+        "    return len(d)\n"
+        "}\n"));
+}
+
+TEST(OwnershipCheckTest, DeferOwnWithNoLaterUseAccepted) {
+    EXPECT_TRUE(ownAccepts(
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer sink(own d)\n"
+        "}\n"));
+}
+
+TEST(OwnershipCheckTest, DeferDubLeavesSourceLive) {
+    EXPECT_TRUE(ownAccepts(
+        "def use(d: list[int]) -> None { }\n"
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer use(dub d)\n"
+        "    sink(own d)\n"
         "}\n"));
 }

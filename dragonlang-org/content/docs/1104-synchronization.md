@@ -194,7 +194,6 @@ in the `Counter` example.
 | A broadcast flag | `Event()` - `set()` / `wait()` / `is_set()` |
 | A thread-safe int list / str→int map | `from collections.concurrent import ConcurrentList, ConcurrentDict` |
 
-That completes the concurrency model - three colorless tiers and the primitives to
-coordinate them. Next, a different kind of building block:
-[Templates](/docs/1201-templates), Dragon's typed, auto-escaping approach to
-generating HTML, SQL, and other structured text.
+That covers coordinating work that runs NOW, elsewhere. The last piece of the
+concurrency story is the opposite move - scheduling a call to run LATER, right
+here, when the current scope ends: [Defer: Scope-Exit Calls](/docs/1105-defer).

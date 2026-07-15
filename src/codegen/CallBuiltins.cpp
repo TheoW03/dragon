@@ -1294,11 +1294,15 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
                          node.args[0]->type->kind() == Type::Kind::Bytes;
                 (void)argKind;
             }
-            else {
+            bool classCheck = false;
+            if (typeName != "int" && typeName != "float" && typeName != "bool" &&
+                typeName != "str" && typeName != "list" && typeName != "dict" &&
+                typeName != "tuple" && typeName != "set" && typeName != "bytes") {
                 // User-defined class: walk the inheritance chain so an instance
                 // of a subclass IS an instance of any ancestor (Python parity).
                 // Previously this was an exact-name match, so isinstance(dog,
                 // Animal) was wrongly False.
+                classCheck = true;
                 std::string c = argClassName;
                 while (!c.empty()) {
                     if (c == typeName) { result = true; break; }
@@ -1308,6 +1312,23 @@ bool CodeGen::emitBuiltinCall(CallExpr& node, const std::string& name) {
             }
             // Evaluate args for side effects
             node.args[0]->accept(*this);
+            // A statically-matching CLASS check must still test the runtime
+            // value: an Optional[T] slot holding None is a null instance and
+            // `isinstance(none_value, T)` must be False, not a compile-time
+            // True that sends a later method call through a null receiver
+            // (that was a real SEGV: ODB.close() on a lock-less handle).
+            if (result && classCheck) {
+                llvm::Value* recv = impl_->lastValue;
+                if (recv && recv->getType()->isPointerTy()) {
+                    impl_->lastValue = impl_->builder->CreateIsNotNull(recv, "isinstance.nn");
+                    return true;
+                }
+                if (recv && recv->getType() == impl_->i64Type) {
+                    impl_->lastValue = impl_->builder->CreateICmpNE(
+                        recv, llvm::ConstantInt::get(impl_->i64Type, 0), "isinstance.nn");
+                    return true;
+                }
+            }
             impl_->lastValue = llvm::ConstantInt::get(impl_->i1Type, result ? 1 : 0);
             return true;
         }

@@ -134,8 +134,13 @@ void CodeGen::visit(AssignStmt& node) {
                     return impl_->currentClassName;
                 auto vit = impl_->varClassNames.find(attrObjName->name);
                 if (vit != impl_->varClassNames.end()) return vit->second;
+                return "";
             }
-            return "";
+            // Nested base (`self.pager.pending[k] = v`): resolve the base
+            // expression's static class so container-field stores through a
+            // chain land exactly like single-level ones (they silently
+            // no-oped before - caught by test_nested_attr_store.dr).
+            return impl_->resolveExprClassName(attrExpr->object.get());
         };
         if (auto* sub = dynamic_cast<SubscriptExpr*>(target.get())) {
             bool isDict = false;
@@ -572,13 +577,20 @@ void CodeGen::visit(AssignStmt& node) {
         // Walk inheritance so subclasses inherit parent setters. Falls through to
         // field write when no setter is registered for this attribute.
         if (auto* attrTarget = dynamic_cast<AttributeExpr*>(target.get())) {
-            if (auto* objName = dynamic_cast<NameExpr*>(attrTarget->object.get())) {
+            {
                 std::string className;
-                if (objName->name == "self" && !impl_->currentClassName.empty()) {
-                    className = impl_->currentClassName;
+                if (auto* objName = dynamic_cast<NameExpr*>(attrTarget->object.get())) {
+                    if (objName->name == "self" && !impl_->currentClassName.empty()) {
+                        className = impl_->currentClassName;
+                    } else {
+                        auto vit = impl_->varClassNames.find(objName->name);
+                        if (vit != impl_->varClassNames.end()) className = vit->second;
+                    }
                 } else {
-                    auto vit = impl_->varClassNames.find(objName->name);
-                    if (vit != impl_->varClassNames.end()) className = vit->second;
+                    // Nested base (`a.b.prop = v`): resolve the base
+                    // expression's static class so chained targets dispatch
+                    // setters exactly like single-level ones.
+                    className = impl_->resolveExprClassName(attrTarget->object.get());
                 }
                 if (!className.empty()) {
                     std::string setterClass;
@@ -621,15 +633,24 @@ void CodeGen::visit(AssignStmt& node) {
             }
         }
 
-        // Class field assignment: self.x = val or instance.x = val
+        // Class field assignment: self.x = val or instance.x = val.
+        // The base may itself be an attribute chain (`self.pager.log_tail = v`,
+        // `o.mid.inner.a = v`): resolve its static class and store through the
+        // same GEP path. Without the nested-base case the assignment silently
+        // no-ops - it compiles, runs, and changes nothing (caught by
+        // test_nested_attr_store.dr).
         if (auto* attrTarget = dynamic_cast<AttributeExpr*>(target.get())) {
-            if (auto* objName = dynamic_cast<NameExpr*>(attrTarget->object.get())) {
+            {
                 std::string className;
-                if (objName->name == "self" && !impl_->currentClassName.empty()) {
-                    className = impl_->currentClassName;
+                if (auto* objName = dynamic_cast<NameExpr*>(attrTarget->object.get())) {
+                    if (objName->name == "self" && !impl_->currentClassName.empty()) {
+                        className = impl_->currentClassName;
+                    } else {
+                        auto vit = impl_->varClassNames.find(objName->name);
+                        if (vit != impl_->varClassNames.end()) className = vit->second;
+                    }
                 } else {
-                    auto vit = impl_->varClassNames.find(objName->name);
-                    if (vit != impl_->varClassNames.end()) className = vit->second;
+                    className = impl_->resolveExprClassName(attrTarget->object.get());
                 }
 
                 if (!className.empty()) {

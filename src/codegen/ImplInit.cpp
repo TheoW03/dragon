@@ -1882,8 +1882,40 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                 } else {
                     mParamStart = 1;  // skip explicit self
                 }
+                // Build the LLVM param list. A `*args`/`**kwargs` method param
+                // collapses to a single i8* (list/dict pointer) exactly like a
+                // variadic free function (forwardDeclareFunctions), and its
+                // VarArgInfo drives the call-site packing (packVarArgMethodArgs).
+                // The bare `*` keyword-only separator (isVarArg with an empty
+                // name) has no LLVM param and is skipped everywhere below so the
+                // side maps stay aligned to the LLVM parameter count.
+                VarArgInfo vaInfo;
+                bool seenVarArg = false;
                 for (size_t i = mParamStart; i < methodDecl->params.size(); ++i) {
-                    methodParamTypes.push_back(typeExprToLLVM(methodDecl->params[i].type.get()));
+                    const auto& p = methodDecl->params[i];
+                    if (p.isVarArg) {
+                        seenVarArg = true;
+                        if (p.name.empty()) continue;  // bare * separator
+                        vaInfo.hasVarArg = true;
+                        vaInfo.varArgName = p.name;
+                        if (p.type) {
+                            Type::Kind tk =
+                                elemVarKindToTypeKind(typeExprToKind(p.type.get()));
+                            vaInfo.varArgElemTag = typeKindToElemTag(tk);
+                            vaInfo.varArgElemIsAny = (tk == Type::Kind::Any);
+                        }
+                        methodParamTypes.push_back(i8PtrType);
+                        continue;
+                    }
+                    if (p.isKwArg) {
+                        seenVarArg = true;
+                        vaInfo.hasKwArg = true;
+                        vaInfo.kwArgName = p.name;
+                        methodParamTypes.push_back(i8PtrType);
+                        continue;
+                    }
+                    if (!seenVarArg) vaInfo.numRegularParams++;
+                    methodParamTypes.push_back(typeExprToLLVM(p.type.get()));
                 }
 
                 // A method whose body contains `yield` is a GENERATOR method:
@@ -1906,6 +1938,11 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                 auto* methodFuncType = llvm::FunctionType::get(retType, methodParamTypes, false);
                 llvm::Function::Create(methodFuncType, llvm::Function::InternalLinkage,
                                        methodName, module.get());
+                // Register variadic metadata under the (post-mangling, post-ovN)
+                // method symbol so the call site packs surplus positionals into
+                // the *args list and surplus keywords into the **kwargs dict.
+                if (vaInfo.hasVarArg || vaInfo.hasKwArg)
+                    funcVarArgInfo[methodName] = vaInfo;
                 if (methodIsGenerator) {
                     generatorFunctions.insert(methodName);
                     generatorYieldKinds[methodName] = inferYieldKind(methodDecl->body);
@@ -1926,8 +1963,18 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                         mowns.push_back(false);
                     }
                     for (size_t i = mParamStart; i < methodDecl->params.size(); ++i) {
-                        mkinds.push_back(typeExprToKind(methodDecl->params[i].type.get()));
-                        mowns.push_back(methodDecl->params[i].isOwn);
+                        const auto& p = methodDecl->params[i];
+                        if (p.isVarArg && p.name.empty()) continue;  // bare *
+                        if (p.isVarArg) {
+                            mkinds.push_back(VarKind::List); mowns.push_back(false);
+                            continue;
+                        }
+                        if (p.isKwArg) {
+                            mkinds.push_back(VarKind::Dict); mowns.push_back(false);
+                            continue;
+                        }
+                        mkinds.push_back(typeExprToKind(p.type.get()));
+                        mowns.push_back(p.isOwn);
                     }
                     funcParamKinds[methodName] = std::move(mkinds);
                     funcParamOwns[methodName] = std::move(mowns);
@@ -1940,7 +1987,15 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                         defaults.push_back(nullptr); // self has no default
                     }
                     for (size_t i = mParamStart; i < methodDecl->params.size(); ++i) {
-                        defaults.push_back(methodDecl->params[i].defaultValue.get());
+                        const auto& p = methodDecl->params[i];
+                        if (p.isVarArg && p.name.empty()) continue;  // bare *
+                        // *args/**kwargs have no default; the pack is always
+                        // synthesized at the call site.
+                        if (p.isVarArg || p.isKwArg) {
+                            defaults.push_back(nullptr);
+                            continue;
+                        }
+                        defaults.push_back(p.defaultValue.get());
                     }
                     funcParamDefaults[methodName] = std::move(defaults);
                     // Record defining module so cross-module method calls
@@ -1957,7 +2012,9 @@ void CodeGen::Impl::forwardDeclareClasses(dragon::Module& mod) {
                         names.push_back("self");
                     }
                     for (size_t i = mParamStart; i < methodDecl->params.size(); ++i) {
-                        names.push_back(methodDecl->params[i].name);
+                        const auto& p = methodDecl->params[i];
+                        if (p.isVarArg && p.name.empty()) continue;  // bare *
+                        names.push_back(p.name);
                     }
                     funcParamNames[methodName] = std::move(names);
                 }

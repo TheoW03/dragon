@@ -160,6 +160,7 @@ private:
     std::unique_ptr<Stmt> tryStatement();
     std::unique_ptr<Stmt> withStatement();
     std::unique_ptr<Stmt> threadStatement();
+    std::unique_ptr<Stmt> deferStatement();
     std::unique_ptr<Stmt> matchStatement();
     MatchPattern parsePattern(bool allowCommaOr = true);
     std::unique_ptr<Stmt> functionDeclaration();

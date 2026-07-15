@@ -211,6 +211,14 @@ enum DragonCleanupKind {
     DCLEAN_CALLABLE = 2,  // dragon_decref_callable(val)  (tag-gated: no-ops on bare fn ptr)
     DCLEAN_OBJ      = 3,  // dragon_decref(val)           (containers, instances, cells, deque, file)
     DCLEAN_UNION    = 4,  // tag-conditional, using the entry's `tag` (mirrors emitUnionDecref)
+    // A pending `defer` call (defer.md): val is a codegen-built thunk
+    // `void(*)(int64_t*)`, tag is its snapshot-arg count. The `tag` entries
+    // pushed directly below carry the snapshot VALUES, each with its own
+    // release kind (0 for scalars and own-moved values the callee adopts).
+    // The unwinder calls the thunk over those entries while they are still
+    // on the stack, then keeps popping so they drain per-kind as usual -
+    // defers therefore run before the release of everything they borrow.
+    DCLEAN_DEFER_CALL = 5,
 };
 
 enum VThreadYieldReason {

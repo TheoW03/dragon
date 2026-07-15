@@ -151,6 +151,7 @@ public:
     void visit(TryStmt& node) override;
     void visit(WithStmt& node) override;
     void visit(ThreadStmt& node) override;
+    void visit(DeferStmt& node) override;
     void visit(MatchStmt& node) override;
     void visit(ReturnStmt& node) override;
     void visit(RaiseStmt& node) override;

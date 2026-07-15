@@ -21,7 +21,7 @@
 # cannot span lines; the larger tables are split across a few sets and combined
 # in the `_is_*` predicates below.
 
-const _KW: set[str] = {"if", "elif", "else", "while", "for", "break", "continue", "return", "pass", "yield", "raise", "try", "except", "catch", "finally", "with", "import", "from", "as", "fire", "thread", "async", "await", "template", "def", "class", "lambda", "global", "nonlocal", "assert", "del", "const", "static", "extern", "and", "or", "not", "is", "in", "match", "case", "default"}
+const _KW: set[str] = {"if", "elif", "else", "while", "for", "break", "continue", "return", "pass", "yield", "raise", "try", "except", "catch", "finally", "with", "import", "from", "as", "fire", "defer", "thread", "async", "await", "template", "def", "class", "lambda", "global", "nonlocal", "assert", "del", "const", "static", "extern", "own", "dub", "and", "or", "not", "is", "in", "match", "case", "default"}
 
 const _CONST: set[str] = {"True", "False", "None", "Ellipsis", "NotImplemented", "true", "false"}
 

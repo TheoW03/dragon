@@ -811,6 +811,16 @@ void Sema::visit(ReturnStmt& node) {
     if (node.value) node.value->accept(*this);
 }
 
+void Sema::visit(DeferStmt& node) {
+    // No scope ends before process exit at module level, so a module-level
+    // defer could never run; an explicit shutdown-hook mechanism, if ever
+    // wanted, is its own ADR.
+    if (!impl_->isInFunction) {
+        error(node.location(), "'defer' outside function");
+    }
+    if (node.call) node.call->accept(*this);
+}
+
 void Sema::visit(RaiseStmt& node) {
     if (node.exception) node.exception->accept(*this);
     if (node.cause) node.cause->accept(*this);

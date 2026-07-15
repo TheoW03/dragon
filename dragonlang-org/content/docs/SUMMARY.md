@@ -78,6 +78,7 @@
 - [Colorless async/await](1102-async-await.md)
 - [Scoped and Manual OS Threads](1103-os-threads.md)
 - [Synchronization](1104-synchronization.md)
+- [Defer: Scope-Exit Calls](1105-defer.md)
 
 # Templates
 

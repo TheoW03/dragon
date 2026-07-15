@@ -773,6 +773,13 @@ void TypeChecker::visit(ThreadStmt& node) {
     impl_->popScope();
 }
 
+void TypeChecker::visit(DeferStmt& node) {
+    // The operand type-checks as an ordinary call, so signature and own-mode
+    // rules (E13/E14) apply at the defer statement unchanged. The call's
+    // return value is discarded by the grammar; nothing to flow.
+    if (node.call) inferType(node.call.get());
+}
+
 void TypeChecker::visit(MatchStmt& node) {
     if (node.subject) inferType(node.subject.get());
     // Recursively infer types for all literals in pattern tree

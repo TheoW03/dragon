@@ -543,6 +543,12 @@ Flow DefiniteAssignment::Impl::analyzeStmt(Stmt* s, Flow flow) {
         checkExpr(es->expr.get(), flow);
         return flow;
     }
+    if (auto* ds = dynamic_cast<DeferStmt*>(s)) {
+        // Arguments and receiver evaluate AT the defer statement, so every
+        // name it references must be definitely assigned here, not at exit.
+        checkExpr(ds->call.get(), flow);
+        return flow;
+    }
     if (auto* an = dynamic_cast<AnnAssignStmt*>(s)) {
         // `self.x: T = v` / `obj.x: T` - attribute target, not a local.
         if (auto* nm = dynamic_cast<NameExpr*>(an->target.get())) {

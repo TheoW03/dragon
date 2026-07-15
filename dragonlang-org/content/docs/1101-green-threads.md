@@ -44,29 +44,59 @@ another, instead of blocking the underlying OS thread.
 
 A green thread runs concurrently with the code that fired it, so every heap
 value that crosses the `fire` boundary must arrive in a way that cannot race.
-There are four doors, and anything else is a compile error at the fire line:
+There are five doors, and anything else is a compile error at the fire line:
 
 ```dragon
 req: Request = parse_request(conn)      # this function still owns req
 counts: dict[str, int] = load_counts()
 
-fire handle(req)              # error E12: 'req' crosses a thread boundary;
-                              # move it (own req), copy it (dub req),
-                              # or make it a locked type
+fire mutate(req)              # error E12: 'req' crosses a thread boundary;
+                              # 'mutate' writes its argument, so move it
+                              # (own req), copy it (dub req), or lock it
 
 fire handle(own req)          # door 1: moved - the green thread becomes the
                               #         sole owner; req is dead on this side
 fire tally(dub counts)        # door 2: copied - the green thread gets its own
 fire banner(GREETING)         # door 3: an immortal const string literal
 fire record(router)           # door 4: an internally-locked type
+fire read_only(counts)        # door 5: shared read-only - 'read_only' provably
+                              #         never writes counts, so N threads share
+                              #         it at zero copy
 ```
 
 Door 1 is the default to reach for: a moved value belongs to exactly one
 thread, proven at compile time, so there is no lock to take and no data race
 to debug. Use door 2 when this side still needs the value, and door 4 (a
 class whose storage is guarded by an `own` Lock field, like the HTTP
-`Router`) when threads genuinely must share mutable state. The full rules
-live in [Ownership](/docs/1604-ownership); the lock types in
+`Router`) when threads genuinely must share mutable state.
+
+Door 5 is the one you never have to ask for. When the fired function provably
+only *reads* the argument - no `append`, no `x[i] = ...`, no `x.field = ...` -
+the value is shared across the threads at zero copy. `fire` already marks it so
+its reference count is updated atomically, and a value nobody writes cannot be
+raced. This is the worker-pool shape: fire one task per job over the same shared
+data, then join them all. The rule reads cleanly in reverse: **a plain
+`fire f(x)` that compiles is proof that `f` only reads `x`.** The day you need to
+write it, the compiler makes you say so - `dub x` for a private copy, `own x` to
+hand it over - so a `dub` at a fire site is always a visible admission that a
+copy was needed.
+
+```dragon
+def total_price(items: list[Item]) -> int { ... }   # reads items, never writes
+
+orders: list[Item] = load_orders()
+tasks: list[Task[int]] = []
+w: int = 0
+while w < 8 {
+    t: Task[int] = fire total_price(orders)   # door 5: every task reads `orders`
+    tasks.append(t)
+    w = w + 1
+}
+grand: int = 0
+for t in tasks { grand = grand + t.join() }
+```
+
+The full rules live in [Ownership](/docs/1604-ownership); the lock types in
 [Synchronization](/docs/1104-synchronization).
 
 ## Task handles: `Task[T]`
@@ -166,3 +196,9 @@ job, then join them all.
 `join()` is the explicit way to wait. The next chapter introduces the other way -
 `await` - and the colorless model that lets it appear in *any* function:
 [Colorless async/await](/docs/1102-async-await).
+
+One more thing before you go: `fire` has a twin. `fire f(x)` runs f NOW on
+another green thread; `defer f(x)` runs f LATER on this thread, when the
+current scope ends - same call shape, same `own`/`dub` argument modes, opposite
+half of the coin. Cleanup that must run on every exit path lives there:
+[Defer: Scope-Exit Calls](/docs/1105-defer).

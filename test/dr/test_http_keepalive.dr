@@ -218,10 +218,38 @@ class ChunkedResponseTests(TestCase) {
 }
 
 
-class TakeoverSeamTests(TestCase) {
-    # res.takeover(fn) hands the live ConnReader to a callback and exits the
+class CedeSeamTests(TestCase) {
+    # A response is a document OR a handoff, never both: cede() on a
+    # response that already carries a body (or chunks) fails closed instead
+    # of silently shipping the body ahead of the handoff.
+    def test_cede_with_body_raises() -> None {
+        const res: Response = Response()
+        res.text("half a document")
+        raised: bool = false
+
+        def own_conn(conn: ConnReader) -> None {
+        }
+        try {
+            res.cede(own_conn)
+        } except ValueError {
+            raised = true
+        }
+        self.assertTrue(raised)
+
+        const res2: Response = Response()
+        res2.chunk("half a stream")
+        raised = false
+        try {
+            res2.cede(own_conn)
+        } except ValueError {
+            raised = true
+        }
+        self.assertTrue(raised)
+    }
+
+    # res.cede(fn) hands the live ConnReader to a callback and exits the
     # loop WITHOUT closing the fd - the W2 WebSocket-upgrade seam.
-    def test_takeover_invokes_callback_and_skips_close() {
+    def test_cede_invokes_callback_and_skips_close() {
         const app: Router = Router(0)
 
         def upgrade(req: Request, res: Response, ctx: Context) -> None {
@@ -230,14 +258,14 @@ class TakeoverSeamTests(TestCase) {
             def own(conn: ConnReader) -> None {
                 conn.send("OWNED")
             }
-            res.takeover(own)
+            res.cede(own)
         }
         app.GET("/ws", upgrade)
 
         const mr: MemoryReader = MemoryReader([
             b"GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"])
         app.serve_connection(mr)
-        # The 101 went out, then the takeover callback wrote "OWNED" over the
+        # The 101 went out, then the cede callback wrote "OWNED" over the
         # same reader, and the loop returned without close() (W2 owns the fd).
         self.assertIn("101", mr.sent)
         self.assertIn("OWNED", mr.sent)
@@ -246,4 +274,4 @@ class TakeoverSeamTests(TestCase) {
 }
 
 
-main([RequestReaderTests(), KeepAliveLoopTests(), ChunkedResponseTests(), TakeoverSeamTests()])
+main([RequestReaderTests(), KeepAliveLoopTests(), ChunkedResponseTests(), CedeSeamTests()])

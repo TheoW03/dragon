@@ -564,8 +564,8 @@ void CodeGen::visit(ReturnStmt& node) {
     // (the trampoline marks the generator as exhausted after body returns)
     if (impl_->generatorPtr) {
         impl_->emitExcFramePops(impl_->currentFnTryFrames());
-        impl_->emitInlineExitCleanups(*this, impl_->currentFnExitCleanupBase());
-        impl_->emitAllScopeCleanup();
+        impl_->emitEarlyExitCleanups(*this, 0,
+                                     impl_->currentFnExitCleanupBase());
         impl_->builder->CreateRetVoid();
         auto* deadBB = llvm::BasicBlock::Create(
             *impl_->context, "ret.dead", impl_->currentFunction);
@@ -735,7 +735,20 @@ void CodeGen::visit(ReturnStmt& node) {
                 // `return path[idx+1:]` leaked its result every call). Mirror
                 // isBorrowedHeapExpr's slice carve-out: only an element read
                 // borrows; a slice is owned.
-                if (dynamic_cast<SliceExpr*>(subExpr->index.get()) == nullptr) {
+                //
+                // AND EXCEPT a STRING element read (`return s[i]`): strings are
+                // immutable, so dragon_str_index mallocs a fresh 1-char string -
+                // owned exactly like a slice, with no container holding a
+                // reference. isBorrowedHeapExpr has carried this carve-out for
+                // a while; this return path predated it, so every
+                // `def peek() -> str { return self.src[i] }` came back +2 and
+                // leaked one string per call (the GraphQL parser hot loop found
+                // it). list/dict element returns keep the incref: those really
+                // do borrow the container's reference.
+                bool ownedStrElem = subExpr->object && subExpr->object->type &&
+                    subExpr->object->type->kind() == Type::Kind::Str;
+                if (dynamic_cast<SliceExpr*>(subExpr->index.get()) == nullptr &&
+                    !ownedStrElem) {
                     Impl::VarKind kind = Impl::VarKind::Other;
                     if (node.value->type)
                         kind = Impl::typeKindToVarKind(node.value->type->kind());
@@ -745,13 +758,13 @@ void CodeGen::visit(ReturnStmt& node) {
             }
         }
         impl_->emitExcFramePops(impl_->currentFnTryFrames());
-        impl_->emitInlineExitCleanups(*this, impl_->currentFnExitCleanupBase());
-        impl_->emitAllScopeCleanup();
+        impl_->emitEarlyExitCleanups(*this, 0,
+                                     impl_->currentFnExitCleanupBase());
         impl_->builder->CreateRet(retVal);
     } else {
         impl_->emitExcFramePops(impl_->currentFnTryFrames());
-        impl_->emitInlineExitCleanups(*this, impl_->currentFnExitCleanupBase());
-        impl_->emitAllScopeCleanup();
+        impl_->emitEarlyExitCleanups(*this, 0,
+                                     impl_->currentFnExitCleanupBase());
         impl_->builder->CreateRetVoid();
     }
     // Create dead block for any subsequent code in the enclosing block
@@ -767,8 +780,8 @@ void CodeGen::visit(BreakStmt&) {
         // the count recorded at loop entry) - the jump lands at breakBlock,
         // still inside any try enclosing the loop.
         impl_->emitExcFramePops(impl_->tryFrameFuncs.size() - impl_->loopStack.top().tryFrameDepth);
-        impl_->emitInlineExitCleanups(*this, impl_->loopStack.top().exitCleanupDepth);
-        impl_->emitScopeCleanupToDepth(impl_->loopStack.top().scopeDepth);
+        impl_->emitEarlyExitCleanups(*this, impl_->loopStack.top().scopeDepth,
+                                     impl_->loopStack.top().exitCleanupDepth);
         impl_->builder->CreateBr(impl_->loopStack.top().breakBlock);
     }
 }
@@ -776,14 +789,285 @@ void CodeGen::visit(BreakStmt&) {
 void CodeGen::visit(ContinueStmt&) {
     if (!impl_->loopStack.empty()) {
         impl_->emitExcFramePops(impl_->tryFrameFuncs.size() - impl_->loopStack.top().tryFrameDepth);
-        impl_->emitInlineExitCleanups(*this, impl_->loopStack.top().exitCleanupDepth);
-        impl_->emitScopeCleanupToDepth(impl_->loopStack.top().scopeDepth);
+        impl_->emitEarlyExitCleanups(*this, impl_->loopStack.top().scopeDepth,
+                                     impl_->loopStack.top().exitCleanupDepth);
         impl_->builder->CreateBr(impl_->loopStack.top().continueBlock);
     }
 }
 
 void CodeGen::visit(PassStmt&) {
     // No-op
+}
+
+// defer <call> (defer.md): arguments and the method receiver evaluate HERE
+// into an i64 snapshot array; only the call runs at scope exit. The entry
+// appended to the current Scope is emitted by emitScopeCleanupFor on every
+// normal exit edge (LIFO, before the RC decref pass), and the runtime
+// cleanup-stack entries registered below make the same thunk run during a
+// longjmp unwind. Zero heap either way: the snapshot array is an entry
+// alloca and the unwind entries live on the preallocated cleanup stack.
+void CodeGen::visit(DeferStmt& node) {
+    auto* call = dynamic_cast<CallExpr*>(node.call.get());
+    if (!call) {
+        impl_->addError("defer requires a direct call", node.location());
+        return;
+    }
+    if (impl_->options.gcMode != GCMode::RC) {
+        impl_->addError("defer requires the RC memory mode", node.location());
+        return;
+    }
+    if (impl_->scopes.empty()) return;  // module-level: Sema already refused
+    if (!call->kwArgs.empty()) {
+        impl_->addError("defer does not support keyword arguments yet; "
+                        "pass them positionally", node.location());
+        return;
+    }
+
+    // Resolve the callee to a direct function, mirroring fire's call form.
+    llvm::Function* targetFn = nullptr;
+    std::string calleeName;
+    bool isMethodCall = false;
+    int deferVtIdx = -1;         // >= 0: dispatch through the vtable (D026)
+    llvm::Value* selfVal = nullptr;
+    Expr* selfExpr = nullptr;
+    if (auto* nameExpr = dynamic_cast<NameExpr*>(call->callee.get())) {
+        targetFn = impl_->module->getFunction(nameExpr->name);
+        calleeName = nameExpr->name;
+    } else if (auto* attrExpr =
+               dynamic_cast<AttributeExpr*>(call->callee.get())) {
+        std::string className;
+        std::string owningModule;
+        if (auto* objName = dynamic_cast<NameExpr*>(attrExpr->object.get())) {
+            if (objName->name == "self" && !impl_->currentClassName.empty()) {
+                className = impl_->currentClassName;
+                owningModule = impl_->currentModuleName;
+            } else {
+                auto vit = impl_->varClassNames.find(objName->name);
+                if (vit != impl_->varClassNames.end()) className = vit->second;
+                auto vmIt = impl_->varClassOwningModule.find(objName->name);
+                if (vmIt != impl_->varClassOwningModule.end()) {
+                    owningModule = vmIt->second;
+                } else if (!className.empty()) {
+                    auto cmIt = impl_->classOwningModule.find(className);
+                    if (cmIt != impl_->classOwningModule.end())
+                        owningModule = cmIt->second;
+                }
+            }
+        }
+        // Fall back to the receiver's static type so nested bases
+        // (`defer a.b.close()`) resolve instead of silently missing.
+        if (className.empty() && attrExpr->object->type) {
+            if (auto* inst = dynamic_cast<InstanceType*>(
+                    attrExpr->object->type.get())) {
+                if (inst->classType) className = inst->classType->name;
+            }
+            if (!className.empty()) {
+                auto cmIt = impl_->classOwningModule.find(className);
+                if (cmIt != impl_->classOwningModule.end())
+                    owningModule = cmIt->second;
+            }
+        }
+        if (!className.empty()) {
+            std::string methodFuncName;
+            targetFn = impl_->resolveMethodFunction(
+                owningModule, className, attrExpr->attribute, &methodFuncName);
+            if (targetFn) {
+                calleeName = methodFuncName;
+                isMethodCall = true;
+                attrExpr->object->accept(*this);
+                selfVal = impl_->lastValue;
+                selfExpr = attrExpr->object.get();
+                // D026 parity: a deferred method must dispatch exactly like
+                // the direct call would. The receiver's STATIC class resolved
+                // the symbol, but the runtime value may be a subclass; when
+                // any subclass overrides this method, the thunk goes through
+                // the receiver's vtable, or `defer conn.close()` on a
+                // ConnReader would silently run the base no-op.
+                if (impl_->methodIsOverridden(className, attrExpr->attribute)) {
+                    auto idxIt =
+                        impl_->classMethodVtableIndices.find(className);
+                    if (idxIt != impl_->classMethodVtableIndices.end()) {
+                        auto mIt = idxIt->second.find(attrExpr->attribute);
+                        if (mIt != idxIt->second.end())
+                            deferVtIdx = (int)mIt->second;
+                    }
+                }
+            }
+        }
+    }
+    if (!targetFn) {
+        impl_->addError(
+            "defer: cannot resolve the callee to a direct function or "
+            "method; a computed or closure callee is not supported yet",
+            node.location());
+        return;
+    }
+
+    // Evaluate every argument NOW (snapshot rule) and classify what the
+    // snapshot slot owns. drainKind != Other means the slot holds a +1
+    // released after the deferred call; own-moved values ride into the
+    // callee and drain nothing.
+    std::vector<llvm::Value*> vals;
+    std::vector<Expr*> exprs;
+    if (isMethodCall) {
+        vals.push_back(selfVal);
+        exprs.push_back(selfExpr);
+    }
+    for (auto& a : call->args) {
+        a->accept(*this);
+        vals.push_back(impl_->lastValue);
+        exprs.push_back(a.get());
+    }
+
+    std::vector<Impl::VarKind> drainKinds(vals.size(), Impl::VarKind::Other);
+    for (size_t i = 0; i < vals.size(); ++i) {
+        Expr* e = exprs[i];
+        if (!vals[i]) {
+            impl_->addError("defer: could not evaluate argument",
+                            node.location());
+            return;
+        }
+        auto* nm = dynamic_cast<NameExpr*>(e);
+        if (nm && nm->isMoveMarked) continue;  // own: callee adopts the +1
+        Impl::VarKind tk = e->type
+            ? Impl::typeKindToVarKind(e->type->kind())
+            : Impl::VarKind::Other;
+        if (tk == Impl::VarKind::Union) {
+            impl_->addError(
+                "defer: an argument of Any/union type is not supported yet; "
+                "annotate the concrete type", node.location());
+            return;
+        }
+        if (nm && nm->isDubMarked) {  // dub: the eval minted an owned copy
+            drainKinds[i] = tk;
+            continue;
+        }
+        Impl::VarKind owned = impl_->ownedTempDrainKind(e, vals[i]);
+        if (owned != Impl::VarKind::Other) {
+            drainKinds[i] = owned;  // owned temp: the slot adopts it
+            continue;
+        }
+        if (Impl::isHeapKind(tk)) {
+            // Borrowed heap value. A rodata literal has no header to count -
+            // dup it to a refcounted copy; anything else takes a +1 so a
+            // rebind of the source name cannot strand the snapshot.
+            llvm::Value* heapified = impl_->ensureHeapString(vals[i], e);
+            if (heapified != vals[i]) {
+                vals[i] = heapified;
+                drainKinds[i] = Impl::VarKind::Str;
+            } else {
+                impl_->emitIncrefByKind(vals[i], tk);
+                drainKinds[i] = tk;
+            }
+        }
+    }
+
+    // Fill omitted trailing args from the callee's defaults, evaluated here
+    // (snapshot semantics hold for defaults too). Fresh heap defaults are
+    // owned temps the matching slot adopts.
+    auto* targetTy = targetFn->getFunctionType();
+    if (vals.size() < targetTy->getNumParams()) {
+        std::vector<std::pair<llvm::Value*, Impl::VarKind>> defaultTemps;
+        impl_->fillDefaultArgs(calleeName, targetFn, vals, *this,
+                               &defaultTemps);
+        drainKinds.resize(vals.size(), Impl::VarKind::Other);
+        for (auto& [dv, dk] : defaultTemps)
+            for (size_t i = 0; i < vals.size(); ++i)
+                if (vals[i] == dv) { drainKinds[i] = dk; break; }
+    }
+    if (vals.size() != targetTy->getNumParams()) {
+        impl_->addError("defer: argument count does not match '" +
+                        calleeName + "'", node.location());
+        return;
+    }
+
+    // Coerce to the callee's exact param types and snapshot as i64s.
+    unsigned argc = (unsigned)vals.size();
+    std::vector<llvm::Value*> valsI64(argc);
+    for (unsigned i = 0; i < argc; ++i) {
+        auto* pty = targetTy->getParamType(i);
+        if (!pty->isPointerTy() && !pty->isDoubleTy() && !pty->isIntegerTy()) {
+            impl_->addError(
+                "defer: parameter " + std::to_string(i + 1) + " of '" +
+                calleeName + "' has a type defer cannot snapshot yet",
+                node.location());
+            return;
+        }
+        valsI64[i] = impl_->cleanupValToI64(impl_->coerceArg(vals[i], pty));
+    }
+    auto* func = impl_->currentFunction;
+    auto* arrayTy = llvm::ArrayType::get(impl_->i64Type, std::max(argc, 1u));
+    std::string siteName =
+        calleeName + "_" + std::to_string(impl_->lambdaCounter++);
+    auto* argSlots = impl_->createEntryAlloca(func, "defer.args." + siteName,
+                                              arrayTy);
+    for (unsigned i = 0; i < argc; ++i) {
+        auto* slotPtr = impl_->builder->CreateConstInBoundsGEP2_64(
+            arrayTy, argSlots, 0, i, "defer.snap.p");
+        impl_->builder->CreateStore(valsI64[i], slotPtr);
+    }
+
+    auto* thunk = impl_->buildDeferThunk(targetFn, siteName, deferVtIdx);
+
+    // `defer f(own x)`: the snapshot now carries the moved +1 - null the
+    // binding's slot and its unwind-stack entry so neither path frees what
+    // the deferred callee will adopt.
+    impl_->emitMoveOutSlots(*call);
+
+    // Register the unwind entries, gated on a live exception frame exactly
+    // like every other cleanup push (no frame live here means no handler
+    // exists that an unwind crossing this scope could reach). One entry per
+    // snapshot value with its drain kind, then the thunk entry on top; the
+    // scope's normal-exit rewind pops them unexecuted.
+    {
+        auto* i32Ty = llvm::Type::getInt32Ty(*impl_->context);
+        auto& scope = impl_->scopes.back();
+        if (!scope.cleanupBaseAlloca)
+            scope.cleanupBaseAlloca =
+                impl_->createEntryAllocaI32(func, "clbase", -1);
+        auto* baseAlloca = scope.cleanupBaseAlloca;
+        auto* doBB =
+            llvm::BasicBlock::Create(*impl_->context, "defer.clpush.do", func);
+        auto* contBB = llvm::BasicBlock::Create(*impl_->context,
+                                                "defer.clpush.cont", func);
+        impl_->builder->CreateCondBr(impl_->emitActiveFramesNonZero(), doBB,
+                                     contBB);
+        impl_->builder->SetInsertPoint(doBB);
+        auto* pushFn = impl_->runtimeFuncs["dragon_cleanup_push"];
+        llvm::Value* firstSlot = nullptr;
+        for (unsigned i = 0; i < argc; ++i) {
+            auto* slot = impl_->builder->CreateCall(
+                pushFn,
+                {valsI64[i],
+                 llvm::ConstantInt::get(
+                     i32Ty, impl_->cleanupKindFor(drainKinds[i])),
+                 llvm::ConstantInt::get(i32Ty, 0)},
+                "defer.cl.arg");
+            if (!firstSlot) firstSlot = slot;
+        }
+        auto* thunkI64 = impl_->builder->CreatePtrToInt(thunk, impl_->i64Type,
+                                                        "defer.thunk.i64");
+        auto* callSlot = impl_->builder->CreateCall(
+            pushFn,
+            {thunkI64,
+             llvm::ConstantInt::get(i32Ty, Impl::DCLEAN_DEFER_CALL),
+             llvm::ConstantInt::get(i32Ty, argc)},
+            "defer.cl.call");
+        if (!firstSlot) firstSlot = callSlot;
+        auto* curBase =
+            impl_->builder->CreateLoad(i32Ty, baseAlloca, "clbase.cur");
+        auto* isFirst = impl_->builder->CreateICmpEQ(
+            curBase, llvm::ConstantInt::get(i32Ty, -1), "clbase.first");
+        impl_->builder->CreateStore(
+            impl_->builder->CreateSelect(isFirst, firstSlot, curBase,
+                                         "clbase.new"),
+            baseAlloca);
+        impl_->builder->CreateBr(contBB);
+        impl_->builder->SetInsertPoint(contBB);
+    }
+
+    impl_->scopes.back().deferred.push_back(
+        {thunk, argSlots, argc, std::move(drainKinds)});
 }
 
 void CodeGen::visit(RaiseStmt& node) {

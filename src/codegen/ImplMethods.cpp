@@ -212,6 +212,26 @@ llvm::Function* CodeGen::Impl::resolveMethodFunction(
         std::string sym = mangleClass(owningModule, className) + "_" + methodName;
         auto* fn = module->getFunction(sym);
         if (!fn) {
+            // The caller-supplied owningModule can be stale: the per-variable
+            // owner maps are keyed by bare name and a same-named variable of a
+            // different class in another co-compiled module can leave a wrong
+            // module behind. Before walking UP to a parent's method - which
+            // would silently MASK this class's own override with the base
+            // implementation - re-resolve THIS leaf class's own owning module
+            // and try its own method there first. Strictly additive: a leaf's
+            // own method always wins over an inherited one, so this only ever
+            // corrects a stale-module miss, never changes a hit.
+            std::string ownMod = resolveClassOwningModule(className);
+            if (ownMod != owningModule) {
+                std::string ownSym =
+                    mangleClass(ownMod, className) + "_" + methodName;
+                if (auto* ownFn = module->getFunction(ownSym)) {
+                    fn = ownFn;
+                    sym = ownSym;
+                }
+            }
+        }
+        if (!fn) {
             std::string cur = className;
             while (!fn) {
                 auto pit = classParentNames.find(cur);
@@ -381,14 +401,32 @@ std::string CodeGen::Impl::resolveExprClassName(Expr* expr) {
                 // the stale entry must be ignored. Same staleness reasoning as
                 // the NameExpr path above. (Mirrors D030: the static type is the
                 // truth.)
+                // Trust the entry ONLY when the receiver's own resolved type is
+                // consistent with a list-of-instances (or genuinely un-pinned,
+                // the `x = []` fallback the map exists for). A concrete receiver
+                // that is NOT a list[Instance] - a `list[str]`, or a plain
+                // `str`/`bytes`/`dict`/... whose subscript can never be a class
+                // instance - means the entry was left by a DIFFERENT function's
+                // same-named `list[Class]` param (the map is never cleared per
+                // function). The original guard only caught the `list[non-inst]`
+                // case, so a `src: str` subscript (`src[i+1]`) sailed through and
+                // inherited a stale `src -> FreeEntry`, making `src[i+1] == "="`
+                // take the instance __eq__ (pointer-identity) path instead of
+                // dragon_str_eq - a silent false-negative that only surfaced when
+                // the polluting module was pulled into the same compile graph.
                 bool staleElem = false;
-                if (sub->object->type &&
-                    sub->object->type->kind() == Type::Kind::List) {
-                    if (auto* lt =
-                            dynamic_cast<ListType*>(sub->object->type.get())) {
-                        if (lt->elementType &&
-                            lt->elementType->kind() != Type::Kind::Instance)
-                            staleElem = true;
+                if (sub->object->type) {
+                    Type::Kind rk = sub->object->type->kind();
+                    if (rk == Type::Kind::List) {
+                        auto* lt =
+                            dynamic_cast<ListType*>(sub->object->type.get());
+                        bool elemIsInstance =
+                            lt && lt->elementType &&
+                            lt->elementType->kind() == Type::Kind::Instance;
+                        if (!elemIsInstance) staleElem = true;
+                    } else if (rk != Type::Kind::Unknown &&
+                               rk != Type::Kind::Any) {
+                        staleElem = true;
                     }
                 }
                 if (!staleElem) {
@@ -755,6 +793,10 @@ bool CodeGen::Impl::isOwnedStrResult(llvm::Value* v) {
         // Without this a discarded/arg-passed closure str result leaks every call
         // (e.g. a reactive `bind_text` render closure invoked per Signal.set()).
         if (!fn) return true;
+        return !isBorrowedStrReturnerName(fn->getName().str());
+    }
+
+bool CodeGen::Impl::isBorrowedStrReturnerName(const std::string& name) {
         static const std::unordered_set<std::string> kBorrowedStrReturners = {
             // Returns a pointer into TLS / vthread state (not heap-allocated).
             "dragon_exc_get_msg",
@@ -772,7 +814,7 @@ bool CodeGen::Impl::isOwnedStrResult(llvm::Value* v) {
             "sqlite3_column_name",
             "sqlite3_errmsg",
         };
-        return kBorrowedStrReturners.count(fn->getName().str()) == 0;
+        return kBorrowedStrReturners.count(name) != 0;
     }
 
 bool CodeGen::Impl::isOwnedPtrResult(llvm::Value* v) {
@@ -895,6 +937,11 @@ Type::Kind CodeGen::Impl::resolveDictKeyKind(Expr* expr) {
                     auto vit = varClassNames.find(objName->name);
                     if (vit != varClassNames.end()) cls = vit->second;
                 }
+            } else {
+                // Nested base (`a.b.d[k]`): resolve the base expression's
+                // static class so the key kind is read off the owning class,
+                // exactly like a single-level field access.
+                cls = resolveExprClassName(attr->object.get());
             }
             if (!cls.empty()) {
                 auto cit = classFieldDictKeyKinds.find(cls);
@@ -923,6 +970,10 @@ Type::Kind CodeGen::Impl::resolveDictValueKind(Expr* expr) {
                     auto vit = varClassNames.find(objName->name);
                     if (vit != varClassNames.end()) cls = vit->second;
                 }
+            } else {
+                // Nested base (`a.b.d[k] = v`): same class resolution as the
+                // key-kind path above.
+                cls = resolveExprClassName(attr->object.get());
             }
             if (!cls.empty()) {
                 auto cit = classFieldDictValueKinds.find(cls);
@@ -1298,6 +1349,29 @@ void CodeGen::Impl::popArgTempCleanups(const std::vector<llvm::Value*>& bases) {
     }
 
 void CodeGen::Impl::emitScopeCleanupFor(Scope& scope) {
+        // defer.md section 4: this scope's deferred calls run LIFO ahead of
+        // the RC decref pass, so borrowed snapshots are alive at call time.
+        // The thunk loads each argument from the i64 snapshot array written
+        // at the defer statement; own-moved values ride into the callee.
+        for (auto it = scope.deferred.rbegin(); it != scope.deferred.rend(); ++it) {
+            auto* argsPtr = builder->CreateConstInBoundsGEP2_64(
+                it->argSlots->getAllocatedType(), it->argSlots, 0, 0,
+                "defer.args.p");
+            builder->CreateCall(it->thunk, {argsPtr});
+        }
+        // Drain the snapshot slots that own a +1 (borrow increfs, dub copies,
+        // owned temps). Values adopted by an own param carry VarKind::Other.
+        for (auto& d : scope.deferred) {
+            for (unsigned i = 0; i < d.argc; ++i) {
+                if (d.drainKinds[i] == VarKind::Other) continue;
+                auto* slotPtr = builder->CreateConstInBoundsGEP2_64(
+                    d.argSlots->getAllocatedType(), d.argSlots, 0, i,
+                    "defer.drain.p");
+                auto* v64 = builder->CreateLoad(i64Type, slotPtr, "defer.drain.v");
+                auto* p = builder->CreateIntToPtr(v64, i8PtrType, "defer.drain.ptr");
+                emitDecrefByKind(p, d.drainKinds[i]);
+            }
+        }
         for (auto& [name, alloca] : scope.vars) {
             if (scope.borrowed.count(name)) continue;  // don't decref params
             if (scope.stackAllocated.count(name)) continue;  // B Phase 1: stack instance, no free

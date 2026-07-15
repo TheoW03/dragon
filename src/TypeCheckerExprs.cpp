@@ -818,6 +818,24 @@ void TypeChecker::visit(AttributeExpr& node) {
         }
     }
 
+    // Commandment #3: a member access on a statically-`Any` receiver cannot be
+    // dispatched - Dragon has no duck typing, so the concrete type must be known
+    // AT the access. Previously this fell through to `Unknown` and silently
+    // miscompiled: a `Task[int]` stored in a bare `list` (= `list[Any]`) lost the
+    // handle tag that drives `join()`, so `for t in tasks { t.join() }` returned
+    // garbage instead of the worker's result. Reject it at compile time and point
+    // at the annotation, rather than box-and-pray. (`Unknown` - a not-yet-inferred
+    // forward/transient type - is intentionally NOT caught here; only real `Any`.)
+    if (objType->kind() == Type::Kind::Any) {
+        error(node.location(),
+              "cannot access '" + node.attribute +
+              "' on a value of type `Any`; annotate the concrete type (e.g. "
+              "`list[Task[int]]` rather than a bare `list`) so the member "
+              "resolves - Dragon does not dispatch members on `Any`");
+        node.type = impl_->unknownType;
+        return;
+    }
+
     // `expr.__doc__` is `Optional[str]` (= `Union[str, None]`) regardless of
     // whether the base is a module, function, class, or instance - Python
     // parity. CodeGen lowers this to a niche-ptr load (D030/D031): non-null

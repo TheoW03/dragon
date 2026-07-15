@@ -6,6 +6,170 @@
 
 namespace dragon {
 
+bool CodeGen::Impl::packVarArgMethodArgs(
+        CodeGen& cg, CallExpr& node, const std::string& methodFuncName,
+        llvm::FunctionType* methodFuncType,
+        std::vector<llvm::Value*>& args,
+        std::vector<std::pair<llvm::Value*, VarKind>>& argTemps,
+        const std::string& dispName) {
+    auto vaIt = funcVarArgInfo.find(methodFuncName);
+    if (vaIt == funcVarArgInfo.end()) return true;  // not variadic (caller gates)
+    const VarArgInfo& vaInfo = vaIt->second;
+
+    auto poison = [&]() {
+        lastValue = llvm::ConstantPointerNull::get(
+            llvm::PointerType::getUnqual(*context));
+    };
+
+    // Spread INTO a variadic method (`recv.m(*xs)` / `recv.m(**d)`) is a
+    // separate capability - free functions have it via emitVarArgCall's spread
+    // arm, but packing it here would need the exception-safe pack-cleanup dance
+    // before its dup-key guards raise. Until that lands, diagnose rather than
+    // miscompile, so no leak or bad IR escapes.
+    if (callHasSpread(node)) {
+        addError("call-site spread (`*`/`**`) into a variadic method is not yet "
+                 "supported", node.location());
+        poison();
+        return false;
+    }
+
+    // self (if any) already occupies args[0..selfOffset). For a static variadic
+    // method selfOffset is 0 and this reduces to the free-function shape.
+    const size_t selfOffset = args.size();
+    const size_t numParams = methodFuncType->getNumParams();
+
+    // 1. Regular positional args (those before `*args`). Drain owned heap temps
+    // via the shared classifier so a `def m(a: str, *xs)` regular arg can't leak
+    // (the callee borrows; the packed list/dict below drain through argTemps).
+    size_t llvmIdx = selfOffset;
+    for (size_t i = 0; i < vaInfo.numRegularParams && i < node.args.size(); ++i) {
+        node.args[i]->accept(cg);
+        llvm::Value* arg = lastValue;
+        collectArgTemp(methodFuncName, node.args[i].get(), arg,
+                       (unsigned)llvmIdx, argTemps);
+        if (llvmIdx < numParams)
+            arg = coerceArgFromExpr(node.args[i].get(), arg,
+                                    methodFuncType->getParamType((unsigned)llvmIdx));
+        args.push_back(arg);
+        llvmIdx++;
+    }
+    // 1b. Pad regular slots the caller omitted (a default param BEFORE `*args`)
+    // with null placeholders; fillDefaultArgs fills them at the tail. Without
+    // this the `*args` list would land in the first omitted slot and its own
+    // slot would be null - an LLVM "Operand is null" verify crash.
+    while (args.size() < selfOffset + vaInfo.numRegularParams) {
+        args.push_back(nullptr);
+        llvmIdx++;
+    }
+
+    // 2. Pack surplus positionals into the `*args` list, monomorphized by the
+    // declared element tag (native ints/floats/ptrs; boxed only for Any).
+    // emitTypedListAppend owns each element's borrow/incref discipline, so the
+    // list decref at the tail releases the element refs - no per-element drain.
+    if (vaInfo.hasVarArg) {
+        size_t extra = (node.args.size() > vaInfo.numRegularParams)
+            ? node.args.size() - vaInfo.numRegularParams : 0;
+        auto* cap = llvm::ConstantInt::get(i64Type, (int64_t)extra);
+        llvm::Value* argsList =
+            emitNewTypedList(vaInfo.varArgElemTag, vaInfo.varArgElemIsAny, cap);
+        for (size_t i = vaInfo.numRegularParams; i < node.args.size(); ++i) {
+            node.args[i]->accept(cg);
+            emitTypedListAppend(argsList, lastValue, node.args[i].get(),
+                                vaInfo.varArgElemTag, vaInfo.varArgElemIsAny, cg);
+        }
+        args.push_back(argsList);
+        argTemps.emplace_back(argsList, VarKind::List);
+        llvmIdx++;
+    }
+
+    // 2b. Bind keyword args that NAME a regular param into that positional slot
+    // (so `def m(x: int, **kw)` accepts `m(x=5, y=6)`). funcParamNames includes
+    // "self" at index 0 for an instance method, hence the selfOffset shift when
+    // deciding whether the matched name is a regular param.
+    std::vector<bool> kwConsumed(node.kwArgs.size(), false);
+    if (!node.kwArgs.empty()) {
+        auto pnIt = funcParamNames.find(methodFuncName);
+        if (pnIt != funcParamNames.end()) {
+            const auto& paramNames = pnIt->second;
+            for (size_t ki = 0; ki < node.kwArgs.size(); ++ki) {
+                const std::string& kwName = node.kwArgs[ki].first;
+                if (kwName.empty()) continue;  // no `**` spread here (guarded)
+                auto nameIt =
+                    std::find(paramNames.begin(), paramNames.end(), kwName);
+                if (nameIt == paramNames.end()) continue;  // unknown -> **kwargs
+                size_t idx = (size_t)std::distance(paramNames.begin(), nameIt);
+                if (idx < selfOffset) continue;                    // "self"
+                if (idx - selfOffset >= vaInfo.numRegularParams)   // *args/**kwargs name
+                    continue;                                      // -> **kwargs
+                if (idx < args.size() && args[idx] != nullptr) {
+                    addError(dispName + " got multiple values for argument '" +
+                             kwName + "'", node.location());
+                    poison();
+                    return false;
+                }
+                node.kwArgs[ki].second->accept(cg);
+                llvm::Value* arg = lastValue;
+                collectArgTemp(methodFuncName, node.kwArgs[ki].second.get(), arg,
+                               (unsigned)idx, argTemps);
+                args[idx] = coerceArgFromExpr(
+                    node.kwArgs[ki].second.get(), arg,
+                    methodFuncType->getParamType((unsigned)idx));
+                kwConsumed[ki] = true;
+            }
+        }
+    }
+
+    // 3. Pack the remaining keyword args into the `**kwargs` dict, tagging each
+    // value by its LLVM type and increfing a BORROWED heap string the dict-set
+    // adopts (mirrors emitVarArgCall step 3 / the dict-literal value path). The
+    // dict is a call-site-owned temp released via argTemps at the tail.
+    if (vaInfo.hasKwArg) {
+        auto* cap = llvm::ConstantInt::get(i64Type, (int64_t)node.kwArgs.size());
+        llvm::Value* kwargsDict =
+            builder->CreateCall(runtimeFuncs["dragon_dict_new"], {cap}, "kwargs");
+        for (size_t ki = 0; ki < node.kwArgs.size(); ++ki) {
+            if (kwConsumed[ki]) continue;
+            const std::string& kwName = node.kwArgs[ki].first;
+            if (kwName.empty()) continue;
+            node.kwArgs[ki].second->accept(cg);
+            llvm::Value* val = lastValue;
+            int64_t tag = 0;  // TAG_INT
+            if (val->getType() == i1Type) {
+                tag = 3;  // TAG_BOOL
+                val = builder->CreateZExt(val, i64Type);
+            } else if (val->getType() == f64Type) {
+                tag = 2;  // TAG_FLOAT
+                val = builder->CreateBitCast(val, i64Type);
+            } else if (val->getType()->isPointerTy()) {
+                tag = 1;  // TAG_STR (default for heap pointers)
+                if (options.gcMode == GCMode::RC &&
+                    isBorrowedHeapExpr(node.kwArgs[ki].second.get()))
+                    builder->CreateCall(runtimeFuncs["dragon_incref_str"], {val});
+                val = builder->CreatePtrToInt(val, i64Type);
+            }
+            auto* keyStr = builder->CreateGlobalString(kwName);
+            builder->CreateCall(runtimeFuncs["dragon_dict_set_tagged"],
+                {kwargsDict, keyStr, val,
+                 llvm::ConstantInt::get(i64Type, tag)});
+        }
+        args.push_back(kwargsDict);
+        argTemps.emplace_back(kwargsDict, VarKind::Dict);
+        llvmIdx++;
+    } else {
+        // `*args`-only method: a keyword that bound to no regular param is
+        // unexpected. Guard so codegen never silently drops it.
+        for (size_t ki = 0; ki < node.kwArgs.size(); ++ki) {
+            if (!kwConsumed[ki] && !node.kwArgs[ki].first.empty()) {
+                addError(dispName + " got an unexpected keyword argument '" +
+                         node.kwArgs[ki].first + "'", node.location());
+                poison();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
     // ADR 010: when the TypeChecker resolved this call to a specific method
     // overload, dispatch to that overload's per-index symbol (`name__ovN`).
@@ -2103,6 +2267,34 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                 // co-compiled module.
                 owningModule = impl_->resolveClassOwningModule(className);
             }
+            // AUTHORITATIVE OVERRIDE. varClassNames/varClassOwningModule are
+            // program-wide, keyed by bare variable name only, and never cleared:
+            // a `v: Val` local in one module and a `v: FileVFS` local in another
+            // co-compiled module share the one `v` entry, so a stale (class,
+            // module) pair leaks across functions. When it is the MODULE that
+            // goes stale, resolveMethodFunction mangles the (correct) class under
+            // the wrong module, fails to find its own method, and walks UP to the
+            // parent - silently dispatching FileVFS.size() to the base VFS.size().
+            // The type checker already proved this receiver's exact type, so trust
+            // it: pin (class, module) from the resolved InstanceType, but only when
+            // that pin actually resolves the method, so this can only correct a
+            // misdispatch, never introduce one.
+            if (attr.object->type &&
+                attr.object->type->kind() == Type::Kind::Instance) {
+                auto* inst = static_cast<InstanceType*>(attr.object->type.get());
+                if (inst->classType && !inst->classType->name.empty() &&
+                    impl_->classNames.count(inst->classType->name)) {
+                    const std::string& tcClass = inst->classType->name;
+                    std::string tcMod = inst->classType->definingModule.empty()
+                        ? impl_->resolveClassOwningModule(tcClass)
+                        : inst->classType->definingModule;
+                    if (impl_->resolveMethodFunction(tcMod, tcClass, method,
+                                                     nullptr)) {
+                        className = tcClass;
+                        owningModule = tcMod;
+                    }
+                }
+            }
         }
         if (!className.empty()) {
             // MRO lookup via the shared resolver - walks the inheritance
@@ -2146,11 +2338,19 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                 std::vector<std::pair<llvm::Value*, Impl::VarKind>> argTemps;
                 auto mpkIt = impl_->funcParamKinds.find(methodFuncName);
                 unsigned paramOffset = isStaticCall ? 0 : 1;
-                // C9-B: a spread method call expands its args (with self already
-                // pushed) through the shared routine, then falls into the same
-                // default-fill + (virtual) dispatch tail below. Non-spread calls
+                // A variadic method (`*args`/`**kwargs`) packs surplus
+                // positionals into a list and surplus keywords into a dict
+                // (self already at args[0]), exactly like a variadic free
+                // function; the packs drain through argTemps at the tail. This
+                // takes precedence over the fixed-arity spread path. Non-variadic
+                // spread calls expand through the shared routine; plain calls
                 // keep the original positional + kwarg loops verbatim.
-                if (callHasSpread(node)) {
+                if (impl_->funcVarArgInfo.count(methodFuncName)) {
+                    if (!impl_->packVarArgMethodArgs(
+                            *this, node, methodFuncName, methodFuncType, args,
+                            argTemps, "method '" + method + "'"))
+                        return true;  // diagnosed; lastValue poisoned
+                } else if (callHasSpread(node)) {
                     if (!impl_->expandSpreadCallArgs(
                             *this, methodFunc, node, args, argTemps,
                             "method '" + method + "'"))
@@ -2614,9 +2814,15 @@ bool CodeGen::emitMethodCall(CallExpr& node, AttributeExpr& attr) {
                 }
                 auto mpkIt = impl_->funcParamKinds.find(methodFuncName);
                 unsigned paramOffset = isStaticCall ? 0 : 1;
-                // C9-B spread on a non-Name receiver - same shared expansion +
-                // dispatch tail as the NameExpr-receiver block above.
-                if (callHasSpread(node)) {
+                // Variadic method on a non-Name receiver - pack `*args`/`**kwargs`
+                // (self already pushed), same as the NameExpr-receiver block
+                // above. Precedes the fixed-arity spread path.
+                if (impl_->funcVarArgInfo.count(methodFuncName)) {
+                    if (!impl_->packVarArgMethodArgs(
+                            *this, node, methodFuncName, methodFuncType, args,
+                            argTemps, "method '" + method + "'"))
+                        return true;  // diagnosed; lastValue poisoned
+                } else if (callHasSpread(node)) {
                     if (!impl_->expandSpreadCallArgs(
                             *this, methodFunc, node, args, argTemps,
                             "method '" + method + "'"))

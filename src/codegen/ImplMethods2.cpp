@@ -1145,6 +1145,78 @@ llvm::Function* CodeGen::Impl::buildFireTrampoline(
         return tramp;
     }
 
+llvm::Function* CodeGen::Impl::buildDeferThunk(llvm::Function* targetFn,
+                                               const std::string& siteName,
+                                               int vtableIndex) {
+        // void __dragon_defer_<site>(i64* args): load each param from the
+        // snapshot array at its native type, call, discard the result. The
+        // same thunk runs on the inline normal-exit path and (via the
+        // DCLEAN_DEFER_CALL entry) on the longjmp unwind path, so the two
+        // paths cannot drift.
+        //
+        // vtableIndex >= 0: the deferred callee is a method some subclass
+        // overrides (D026), so the snapshot's `self` (slot 0) may be a
+        // subclass at runtime - dispatch through its vtable exactly like the
+        // direct-call path, or the override is silently skipped.
+        auto* i64PtrTy = llvm::PointerType::getUnqual(*context);
+        auto* thunkType = llvm::FunctionType::get(voidType, {i64PtrTy}, false);
+        auto* thunk = llvm::Function::Create(
+            thunkType, llvm::Function::InternalLinkage,
+            "__dragon_defer_" + siteName, module.get());
+
+        auto* prevFunc = currentFunction;
+        auto* prevBlock = builder->GetInsertBlock();
+        currentFunction = thunk;
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
+        builder->SetInsertPoint(entry);
+
+        llvm::Value* argsPtr = &*thunk->arg_begin();
+        argsPtr->setName("args");
+
+        auto* targetTy = targetFn->getFunctionType();
+        std::vector<llvm::Value*> callArgs;
+        for (unsigned i = 0; i < targetTy->getNumParams(); ++i) {
+            auto* slot = builder->CreateConstInBoundsGEP1_64(
+                i64Type, argsPtr, i, "defer.slot");
+            llvm::Value* raw =
+                builder->CreateLoad(i64Type, slot, "defer.raw");
+            auto* pty = targetTy->getParamType(i);
+            llvm::Value* v = raw;
+            if (pty->isPointerTy())
+                v = builder->CreateIntToPtr(raw, pty, "defer.ptr");
+            else if (pty->isDoubleTy())
+                v = builder->CreateBitCast(raw, pty, "defer.f64");
+            else if (pty->isIntegerTy() && pty != i64Type)
+                v = builder->CreateTrunc(raw, pty, "defer.trunc");
+            callArgs.push_back(v);
+        }
+        if (vtableIndex >= 0 && !callArgs.empty() &&
+            callArgs[0]->getType()->isPointerTy()) {
+            // Same header shape as CallMethods.cpp D026: {refcount, tag, vt*}.
+            auto* headerTy = llvm::StructType::get(
+                *context, {i64Type, i64Type, i8PtrType});
+            auto* vtSlot =
+                builder->CreateStructGEP(headerTy, callArgs[0], 2, "vt_slot");
+            auto* vtPtr = builder->CreateLoad(i8PtrType, vtSlot, "vtable");
+            auto* vtArrTy = llvm::ArrayType::get(i8PtrType, 0);
+            auto* mSlot = builder->CreateGEP(
+                vtArrTy, vtPtr,
+                {builder->getInt64(0), builder->getInt64((int64_t)vtableIndex)},
+                "method_slot");
+            auto* methodPtr =
+                builder->CreateLoad(i8PtrType, mSlot, "method_ptr");
+            builder->CreateCall(targetTy, methodPtr, callArgs);
+        } else {
+            builder->CreateCall(targetFn, callArgs);
+        }
+        builder->CreateRetVoid();
+
+        currentFunction = prevFunc;
+        if (prevBlock) builder->SetInsertPoint(prevBlock);
+        return thunk;
+    }
+
 llvm::Function* CodeGen::Impl::buildGeneratorTrampoline(
     llvm::Function* bodyFn,
     llvm::StructType* argsStructType,

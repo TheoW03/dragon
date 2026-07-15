@@ -129,6 +129,7 @@ void CodeGen::visit(TryStmt& node) {
         Impl::ExitCleanup ec;
         ec.isWith = false;
         ec.func = impl_->currentFunction;
+        ec.scopeDepth = impl_->scopes.size();
         for (auto& s : node.finallyBody) ec.finallyBody.push_back(s.get());
         impl_->exitCleanupStack.push_back(std::move(ec));
     }
@@ -537,11 +538,18 @@ void CodeGen::visit(WithStmt& node) {
             Impl::ExitCleanup ec;
             ec.isWith = true;
             ec.func = func;
+            ec.scopeDepth = impl_->scopes.size();
             for (auto& ci : contextHandles)
                 ec.withItems.push_back({ci.isClassCtx, ci.isLock, ci.className, ci.val, ci.enterResult, ci.isLockTemp, ci.subjectOwned});
             impl_->exitCleanupStack.push_back(std::move(ec));
         }
+        // The with body is its own lexical scope, so a defer registered in it
+        // runs at the body's exit - BEFORE __exit__ (defer.md section 4).
+        impl_->pushScope();
         for (auto& stmt : node.body) stmt->accept(*this);
+        if (!impl_->builder->GetInsertBlock()->getTerminator())
+            impl_->emitScopeCleanup();
+        impl_->popScope();
         impl_->exitCleanupStack.pop_back();
         impl_->tryFrameFuncs.pop_back();
         // Only pop the frame + fall through to cleanup if the body did not
@@ -629,8 +637,13 @@ void CodeGen::visit(WithStmt& node) {
 
         impl_->builder->SetInsertPoint(endBB);
     } else {
-        // No class context managers or locks - nothing to clean up on exit.
+        // No class context managers or locks - nothing to clean up on exit,
+        // but the body is still its own lexical scope (defers, block locals).
+        impl_->pushScope();
         for (auto& stmt : node.body) stmt->accept(*this);
+        if (!impl_->builder->GetInsertBlock()->getTerminator())
+            impl_->emitScopeCleanup();
+        impl_->popScope();
     }
 }
 

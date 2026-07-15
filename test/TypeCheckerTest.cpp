@@ -1958,3 +1958,87 @@ TEST(TypeCheckerTest, LambdaBodyWellTypedOk) {
         "    return doubled\n"
         "}\n"));
 }
+
+//===----------------------------------------------------------------------===//
+// Member access on `Any` is rejected (commandment #3: no duck typing)
+//===----------------------------------------------------------------------===//
+
+// A `Task[int]` stored in a bare `list` (= `list[Any]`) loses the handle tag
+// that drives `.join()` dispatch, so pre-fix `for t in tasks { t.join() }`
+// silently miscompiled to garbage. Dragon has no runtime member dispatch on
+// `Any`, so the access must be a compile error pointing at the annotation.
+TEST(TypeCheckerTest, MethodOnAnyReceiverRejected) {
+    EXPECT_TRUE(checkHasErrors(
+        "def worker(n: int) -> int { return n }\n"
+        "tasks: list = []\n"
+        "a: Task[int] = fire worker(1)\n"
+        "tasks.append(a)\n"
+        "for t in tasks {\n"
+        "    x: int = t.join()\n"
+        "}\n"));
+}
+
+// The honest form - the element type is spelled out - resolves the member and
+// compiles cleanly.
+TEST(TypeCheckerTest, MethodOnTypedTaskListOk) {
+    EXPECT_TRUE(checkOk(
+        "def worker(n: int) -> int { return n }\n"
+        "tasks: list[Task[int]] = []\n"
+        "a: Task[int] = fire worker(1)\n"
+        "tasks.append(a)\n"
+        "for t in tasks {\n"
+        "    x: int = t.join()\n"
+        "}\n"));
+}
+
+// Field read on an `Any` value is rejected for the same reason (not just calls).
+TEST(TypeCheckerTest, FieldReadOnAnyReceiverRejected) {
+    EXPECT_TRUE(checkHasErrors(
+        "xs: list = []\n"
+        "for e in xs {\n"
+        "    y: int = e.value\n"
+        "}\n"));
+}
+
+//===----------------------------------------------------------------------===//
+// defer: the operand call type-checks like any call, so the own-mode
+// signature rules (E13/E14) apply unchanged at the defer statement.
+//===----------------------------------------------------------------------===//
+
+TEST(TypeCheckerTest, DeferOwnArgToBorrowingParamRejected) {
+    EXPECT_TRUE(checkHasErrors(
+        "def use(d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer use(own d)\n"
+        "}\n"));
+}
+
+TEST(TypeCheckerTest, DeferMissingOwnAtOwnParamRejected) {
+    EXPECT_TRUE(checkHasErrors(
+        "def sink(own d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    defer sink(d)\n"
+        "}\n"));
+}
+
+TEST(TypeCheckerTest, DeferArgTypeMismatchRejected) {
+    EXPECT_TRUE(checkHasErrors(
+        "def use(d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    defer use(\"not a list\")\n"
+        "}\n"));
+}
+
+TEST(TypeCheckerTest, DeferWellTypedCallOk) {
+    EXPECT_TRUE(checkOk(
+        "def sink(own d: list[int]) -> None { }\n"
+        "def use(d: list[int]) -> None { }\n"
+        "def f() -> None {\n"
+        "    d: list[int] = [1, 2]\n"
+        "    e: list[int] = [3]\n"
+        "    defer use(d)\n"
+        "    defer sink(own e)\n"
+        "}\n"));
+}

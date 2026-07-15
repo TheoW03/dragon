@@ -49,6 +49,15 @@ struct BindState {
     // elision - the spawn-site incref machinery covers the window); the
     // checker only blocks reads until the happens-before edge.
     std::string lentTask;  // non-empty = lent flavor
+    // Pinned by a pending defer (defer.md section 3): the defer holds the
+    // pointer it snapshotted at its statement, so a later own move or del
+    // of the binding would hand the value to a new owner while the defer
+    // still calls into it. Reads stay legal; only consumption refuses. The
+    // pin dies with the defer's block (pinDepth = scopes.size() at the
+    // defer statement; 0 = unpinned).
+    size_t pinDepth = 0;
+    SourceLocation pinLoc;
+    std::string pinDesc;
 };
 
 struct VarSlot {
@@ -84,6 +93,10 @@ struct OwnershipCheck::Impl {
     // ADR 2.9 door 4: classes with an own Lock field declare themselves
     // internally locked - their instances may cross a spawn as borrows.
     std::unordered_set<std::string> lockGuardedClasses;
+    // ADR 2.9 door 5 (read-only share): top-level free functions by name, so a
+    // `fire worker(shared)` can consult the callee's body to prove `worker`
+    // does not mutate the parameter `shared` binds to. Collected in a prepass.
+    std::unordered_map<std::string, FunctionDecl*> funcsByName;
 
     //==------------------------------------------------------------------=//
     // Scope helpers
@@ -212,6 +225,37 @@ struct OwnershipCheck::Impl {
     // Prepass: collect own fields per class and validate the marker's shape.
     // Also enforces E15 (a raw-resource field MUST be own - a non-own Lock
     // has no owner to destroy it) and E16 on field annotations.
+    // ADR 2.9 door 5: index top-level free functions so a fire-site can look up
+    // the callee's body and prove its parameters are read-only. Methods and
+    // extern (bodyless) defs are skipped - the door currently applies to plain
+    // `fire freefn(x)`; a mutating callee simply misses the door and keeps the
+    // existing lend/E12 behavior, so skipping is conservative, never unsound.
+    void collectFunctions(Module& module) {
+        for (auto& s : module.body) {
+            if (auto* fn = dynamic_cast<FunctionDecl*>(s.get())) {
+                if (!fn->isExtern && !fn->isMethod)
+                    funcsByName[fn->name] = fn;
+            }
+        }
+    }
+
+    // ADR 2.9 door 5: is the callee's parameter at `idx` provably read-only -
+    // i.e. never DIRECTLY mutated in the body (`p.append(...)`, `p[i] = ...`,
+    // `del p[k]`, recursively through control flow)? This is the exact
+    // direct-mutation proof the E17 checker already uses; aliases and mutation
+    // through a further callee remain the runtime concurrent-mutation detector's
+    // job (the model's standing division of labour). A read-only parameter can
+    // be SHARED across a `fire` boundary at zero copy: `mark_shared_deep` (which
+    // the fire site already emits) keeps its refcount atomic, and no writer means
+    // no data race. An `own`/vararg/kwarg parameter is not this path.
+    bool paramIsReadOnly(FunctionDecl* fn, size_t idx) {
+        if (!fn || idx >= fn->params.size()) return false;
+        const Parameter& p = fn->params[idx];
+        if (p.isOwn || p.isVarArg || p.isKwArg || p.name.empty()) return false;
+        SourceLocation where; std::string how;
+        return !bodyMutatesBinding(fn->body, p.name, where, how);
+    }
+
     void collectOwnFields(Module& module) {
         for (auto& s : module.body) {
             auto* cd = dynamic_cast<ClassDecl*>(s.get());
@@ -374,6 +418,18 @@ struct OwnershipCheck::Impl {
         }
         auto it = flow.states.find(s->id);
         BindState b = it == flow.states.end() ? BindState{} : it->second;
+        // A defer-pinned binding cannot be consumed: the pending defer holds
+        // the pointer snapshotted at its statement, so nulling this binding
+        // cannot disarm it - the defer would call into a value somebody else
+        // now owns. Write the fate on each exit path instead, or defer a
+        // wrapper that decides at exit (defer.md section 3).
+        if (b.pinDepth > 0 && b.st != St::Dead && b.st != St::CondDead) {
+            error(n->location(),
+                  "'" + n->name + "' is pinned by a pending defer (" +
+                      atLine(b.pinDesc, b.pinLoc) + "); it cannot be " + verb +
+                      " before the defer runs at scope exit");
+            return 0;
+        }
         switch (b.st) {
             case St::Untracked: {
                 // Untracked bindings (scalars, raw ptr handles) consume as
@@ -428,6 +484,34 @@ struct OwnershipCheck::Impl {
                 return 0;
         }
         return 0;
+    }
+
+    // Pin a heap-tracked binding for the lifetime of the current block: a
+    // pending defer references it (argument or receiver). Scalars and
+    // untracked bindings need no pin - their snapshot is a copy.
+    void pinBinding(NameExpr* n, Flow& flow, SourceLocation deferLoc,
+                    const std::string& desc) {
+        VarSlot* s = resolve(n->name);
+        if (!s) return;
+        auto it = flow.states.find(s->id);
+        if (it == flow.states.end()) return;
+        BindState& b = it->second;
+        if (b.st == St::Owned || b.st == St::OwnedFact ||
+            b.st == St::Borrowed) {
+            b.pinDepth = scopes.size();
+            b.pinLoc = deferLoc;
+            b.pinDesc = desc;
+        }
+    }
+
+    // Called after a frame pop: pins created inside the popped block expire
+    // with it - the block's defers have run by the time control is here.
+    void clearExpiredPins(Flow& flow) {
+        for (auto& [id, b] : flow.states)
+            if (b.pinDepth > scopes.size()) {
+                b.pinDepth = 0;
+                b.pinDesc.clear();
+            }
     }
 
     // Record an escape/alias/capture fact on `name` if it is a tracked owner.
@@ -609,10 +693,25 @@ struct OwnershipCheck::Impl {
                         how = "a subscript store on '" + name + "'";
                         return true;
                     }
+            // A field store `name.f = ...` mutates the binding just as a
+            // subscript store does - it is a write to the shared object, so it
+            // disqualifies the door-5 read-only proof (and is a genuine mutation
+            // for E17's mutate-while-iterating check too).
+            if (auto* at = dynamic_cast<AttributeExpr*>(t))
+                if (auto* obj = dynamic_cast<NameExpr*>(at->object.get()))
+                    if (obj->name == name) {
+                        where = t->location();
+                        how = "a field store on '" + name + "'";
+                        return true;
+                    }
             return false;
         };
         if (auto* e = dynamic_cast<ExprStmt*>(s))
             return exprMutatesBinding(e->expr.get(), name, where, how);
+        // A deferred mutating call still mutates - at the end of the very
+        // iteration that registered it, which is inside the loop.
+        if (auto* d = dynamic_cast<DeferStmt*>(s))
+            return exprMutatesBinding(d->call.get(), name, where, how);
         if (auto* as = dynamic_cast<AssignStmt*>(s)) {
             for (auto& t : as->targets)
                 if (tgtHits(t.get())) return true;
@@ -679,7 +778,8 @@ struct OwnershipCheck::Impl {
     // One expression crossing the spawn boundary.
     // taskName empty + !immediateAwait = discarded handle (hard E12).
     void checkSpawnCrossing(Expr* e, Flow& flow, const std::string& taskName,
-                            bool immediateAwait, SourceLocation fireLoc) {
+                            bool immediateAwait, SourceLocation fireLoc,
+                            FunctionDecl* calleeFn = nullptr, int paramIdx = -1) {
         if (!e) return;
         if (auto* mv = dynamic_cast<NameExpr*>(e); mv && mv->isMoveMarked) {
             consumeBinding(mv, flow, /*isDel=*/false,
@@ -708,6 +808,21 @@ struct OwnershipCheck::Impl {
             return;
         if (immediateAwait) return;  // `await fire f(o)`: the borrow window
                                      // IS the await - already synchronized
+        // Door 5 (read-only share): the callee provably never mutates the
+        // parameter this argument binds to, so N tasks can read the SAME value
+        // concurrently at zero copy - `fire` already marks it SHARED (atomic
+        // refcount via mark_shared_deep) and no writer means no data race. It is
+        // NOT lent-dead: the parent keeps read access and the value survives a
+        // loop back-edge (the fan-out worker-pool shape). It DOES escape, so a
+        // later `del`/`own`-move is refused (recordFact -> Owned*). A mutating
+        // callee misses this door and falls through to the lend/E12 rules below,
+        // where `dub`/`own` remain the explicit, visible answer.
+        if (calleeFn && paramIdx >= 0 &&
+            paramIsReadOnly(calleeFn, (size_t)paramIdx)) {
+            recordFact(nm->name, flow, fireLoc,
+                       atLine("a green thread (read-only share)", fireLoc));
+            return;
+        }
         VarSlot* s = resolve(nm->name);
         auto it = s ? flow.states.find(s->id) : flow.states.end();
         BindState b = it == flow.states.end() ? BindState{} : it->second;
@@ -749,16 +864,82 @@ struct OwnershipCheck::Impl {
             checkExpr(fire->operand.get(), flow);
             return;
         }
-        // The RECEIVER of a fired method call crosses too.
+        // Door 5: resolve a plain free-function callee so each positional arg
+        // can be proven read-only against the matching parameter. Method fires
+        // (AttributeExpr callee) and unknown callees leave calleeFn null - they
+        // keep the existing lend/E12 rules (conservative, never unsound).
+        FunctionDecl* calleeFn = nullptr;
+        if (auto* cn = dynamic_cast<NameExpr*>(call->callee.get())) {
+            auto fit = funcsByName.find(cn->name);
+            if (fit != funcsByName.end()) calleeFn = fit->second;
+        }
+        // The RECEIVER of a fired method call crosses too (no param mapping).
         if (auto* at = dynamic_cast<AttributeExpr*>(call->callee.get()))
             checkSpawnCrossing(at->object.get(), flow, taskName,
                                immediateAwait, fire->location());
-        for (auto& a : call->args)
-            checkSpawnCrossing(a.get(), flow, taskName, immediateAwait,
-                               fire->location());
+        for (size_t ai = 0; ai < call->args.size(); ++ai)
+            checkSpawnCrossing(call->args[ai].get(), flow, taskName,
+                               immediateAwait, fire->location(), calleeFn,
+                               (int)ai);
         for (auto& kw : call->kwArgs)
             checkSpawnCrossing(kw.second.get(), flow, taskName,
                                immediateAwait, fire->location());
+    }
+
+    // defer f(args) / defer recv.m(args): arguments and the receiver evaluate
+    // AT this statement (defer.md section 2). `own x` moves the binding here
+    // through the same consuming ladder as any call-site move; `dub x` reads
+    // (a copy crosses, the source is untouched); a plain borrowed name is
+    // PINNED until the defer's block closes - the defer holds the pointer it
+    // snapshotted, so a later own move or del cannot be allowed to strand it.
+    void processDefer(DeferStmt* d, Flow& flow) {
+        auto* call = dynamic_cast<CallExpr*>(d->call.get());
+        if (!call) return;  // non-call operand: already a parse error
+        std::string calleeDesc = "a deferred call";
+        if (auto* cn = dynamic_cast<NameExpr*>(call->callee.get()))
+            calleeDesc = "the deferred '" + cn->name + "()'";
+        else if (auto* ca = dynamic_cast<AttributeExpr*>(call->callee.get()))
+            calleeDesc = "the deferred '" + ca->attribute + "()'";
+        const std::string sink = atLine(calleeDesc, d->location());
+
+        // Method receiver / bound-closure callee: read now, pin until the
+        // block exits (a free function name is not a local binding, so
+        // pinBinding resolves nothing and no-ops).
+        if (auto* at = dynamic_cast<AttributeExpr*>(call->callee.get())) {
+            checkExpr(at->object.get(), flow);
+            if (auto* rn = dynamic_cast<NameExpr*>(at->object.get()))
+                pinBinding(rn, flow, d->location(), calleeDesc);
+        } else if (auto* cn = dynamic_cast<NameExpr*>(call->callee.get())) {
+            pinBinding(cn, flow, d->location(), calleeDesc);
+        } else {
+            checkExpr(call->callee.get(), flow);
+        }
+
+        for (auto& a : call->args) {
+            if (auto* mv = dynamic_cast<NameExpr*>(a.get());
+                mv && mv->isMoveMarked) {
+                consumeBinding(mv, flow, /*isDel=*/false, sink);
+                continue;
+            }
+            if (auto* dn = dynamic_cast<NameExpr*>(a.get());
+                dn && dn->isDubMarked) {
+                checkRead(dn, flow);
+                continue;
+            }
+            checkExpr(a.get(), flow);
+            if (auto* bn = dynamic_cast<NameExpr*>(a.get()))
+                pinBinding(bn, flow, d->location(), calleeDesc);
+        }
+        for (auto& kw : call->kwArgs) {
+            if (auto* mv = dynamic_cast<NameExpr*>(kw.second.get());
+                mv && mv->isMoveMarked) {
+                consumeBinding(mv, flow, /*isDel=*/false, sink);
+                continue;
+            }
+            checkExpr(kw.second.get(), flow);
+            if (auto* bn = dynamic_cast<NameExpr*>(kw.second.get()))
+                pinBinding(bn, flow, d->location(), calleeDesc);
+        }
     }
 
     // A scope is closing (return / callable end): a still-lent binding means
@@ -1182,6 +1363,7 @@ struct OwnershipCheck::Impl {
         pushFrame();
         for (const auto& s : body) flow = analyzeStmt(s.get(), std::move(flow));
         popFrame();
+        clearExpiredPins(flow);  // the block's defers have run at its exit
         return flow;
     }
 
@@ -1208,6 +1390,10 @@ struct OwnershipCheck::Impl {
 
         if (auto* e = dynamic_cast<ExprStmt*>(s)) {
             checkExpr(e->expr.get(), flow);
+            return flow;
+        }
+        if (auto* d = dynamic_cast<DeferStmt*>(s)) {
+            processDefer(d, flow);
             return flow;
         }
         if (auto* as = dynamic_cast<AssignStmt*>(s)) {
@@ -1335,6 +1521,7 @@ struct OwnershipCheck::Impl {
             for (const auto& st : fo->body)
                 bodyOut = analyzeStmt(st.get(), std::move(bodyOut));
             popFrame();
+            clearExpiredPins(bodyOut);
             checkBackEdge(entry, bodyOut, fo->location());
             std::vector<Flow> outs = std::move(loopBreaks.back());
             loopBreaks.pop_back();
@@ -1369,6 +1556,7 @@ struct OwnershipCheck::Impl {
                 for (const auto& st : h.body)
                     hf = analyzeStmt(st.get(), std::move(hf));
                 popFrame();
+                clearExpiredPins(hf);
                 outs.push_back(std::move(hf));
             }
             Flow out = merge(outs);
@@ -1393,6 +1581,7 @@ struct OwnershipCheck::Impl {
             }
             for (const auto& st : w->body) flow = analyzeStmt(st.get(), std::move(flow));
             popFrame();
+            clearExpiredPins(flow);
             return flow;
         }
         if (auto* m = dynamic_cast<MatchStmt*>(s)) {
@@ -1405,6 +1594,7 @@ struct OwnershipCheck::Impl {
                 if (c.guard) checkExpr(c.guard.get(), cf);
                 for (const auto& st : c.body) cf = analyzeStmt(st.get(), std::move(cf));
                 popFrame();
+                clearExpiredPins(cf);
                 branches.push_back(std::move(cf));
             }
             branches.push_back(flow);  // no case may match
@@ -1592,7 +1782,9 @@ bool OwnershipCheck::analyze(Module& module) {
     // (v1: locals only). Function/class bodies analyze as callables.
     impl_->classOwnFields.clear();
     impl_->currentClassName.clear();
+    impl_->funcsByName.clear();
     impl_->collectOwnFields(module);
+    impl_->collectFunctions(module);
 
     impl_->atModuleLevel = true;
     impl_->pushFrame();

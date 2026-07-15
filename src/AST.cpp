@@ -140,6 +140,7 @@ void ForStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void TryStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void WithStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void ThreadStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
+void DeferStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void MatchStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void ReturnStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
 void RaiseStmt::accept(ASTVisitor& visitor) { visitor.visit(*this); }
@@ -363,6 +364,9 @@ void DefaultASTVisitor::visit(WithStmt& node) {
 }
 void DefaultASTVisitor::visit(ThreadStmt& node) {
     for (auto& s : node.body) s->accept(*this);
+}
+void DefaultASTVisitor::visit(DeferStmt& node) {
+    if (node.call) node.call->accept(*this);
 }
 void DefaultASTVisitor::visit(MatchStmt& node) {
     node.subject->accept(*this);
@@ -1104,6 +1108,14 @@ void ASTPrinter::visit(ThreadStmt& node) {
     writeLine("(thread");
     increaseIndent();
     for (auto& s : node.body) s->accept(*this);
+    decreaseIndent();
+    writeLine(")");
+}
+
+void ASTPrinter::visit(DeferStmt& node) {
+    writeLine("(defer");
+    increaseIndent();
+    if (node.call) node.call->accept(*this);
     decreaseIndent();
     writeLine(")");
 }

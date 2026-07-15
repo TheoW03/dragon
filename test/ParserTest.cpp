@@ -2755,3 +2755,65 @@ TEST(ParserTest, UntypedTemplateHasEmptyContentType) {
     EXPECT_EQ(tmpl->contentType, "");
     EXPECT_EQ(tmpl->body, "hello");
 }
+
+//===----------------------------------------------------------------------===//
+// defer: contextual statement keyword. `defer <call>` parses to a DeferStmt
+// whose operand is a direct call; anything else after `defer` is a parse
+// error. `defer` stays a legal identifier everywhere else (the stdlib http
+// router has a method named defer).
+//===----------------------------------------------------------------------===//
+
+TEST(ParserTest, DeferFunctionCallParses) {
+    auto module = parse(
+        "def f(n: int) -> None { pass }\n"
+        "def g() -> None {\n"
+        "    defer f(1)\n"
+        "}\n");
+    ASSERT_NE(module, nullptr);
+    auto* fn = dynamic_cast<FunctionDecl*>(module->body[1].get());
+    ASSERT_NE(fn, nullptr);
+    auto* d = dynamic_cast<DeferStmt*>(fn->body[0].get());
+    ASSERT_NE(d, nullptr);
+    EXPECT_NE(dynamic_cast<CallExpr*>(d->call.get()), nullptr);
+}
+
+TEST(ParserTest, DeferMethodCallParses) {
+    auto module = parse(
+        "def g(s: str) -> None {\n"
+        "    defer s.upper()\n"
+        "}\n");
+    ASSERT_NE(module, nullptr);
+    auto* fn = dynamic_cast<FunctionDecl*>(module->body[0].get());
+    ASSERT_NE(fn, nullptr);
+    EXPECT_NE(dynamic_cast<DeferStmt*>(fn->body[0].get()), nullptr);
+}
+
+TEST(ParserTest, DeferNonCallRejected) {
+    auto errs = parseErrors(
+        "def g() -> None {\n"
+        "    x: int = 1\n"
+        "    defer x\n"
+        "}\n");
+    EXPECT_FALSE(errs.empty());
+}
+
+TEST(ParserTest, DeferBinaryExprRejected) {
+    auto errs = parseErrors(
+        "def f() -> int { return 1 }\n"
+        "def g() -> None {\n"
+        "    defer f() + f()\n"
+        "}\n");
+    EXPECT_FALSE(errs.empty());
+}
+
+// `defer` is NOT a reserved word: assignment, call, attribute, and method
+// uses all still parse.
+TEST(ParserTest, DeferRemainsUsableAsIdentifier) {
+    auto module = parse(
+        "def defer_task(defer: int) -> int { return defer }\n"
+        "def g() -> int {\n"
+        "    defer: int = 3\n"
+        "    return defer_task(defer)\n"
+        "}\n");
+    ASSERT_NE(module, nullptr);
+}
