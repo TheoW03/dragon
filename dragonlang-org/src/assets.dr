@@ -1,0 +1,25 @@
+# assets.dr - content-hashed version tokens for static assets.
+#
+# Dragonlang org sits behind cloudflare that caches assets at the edge for
+# hours. A deploy that changes app.css would otherwise serve new HTML with
+#
+# Hashes are computed once at startup (cwd = dragonlang-org/, same as the
+# rest of the app). A missing file yields "0" rather than refusing to start:
+# a wrong-cwd dev run should still serve pages, just without cache busting.
+
+from crypto import sha256
+from io import open
+
+def _file_v(path: str) -> str {
+    try {
+        const content: str = open(path).text()
+        const digest: str = sha256(content)
+        return digest[0:8]
+    } except Exception {
+        return "0"
+    }
+}
+
+const CSS_V: str = _file_v("static/app.css")
+const JS_V: str = _file_v("static/app.js")
+

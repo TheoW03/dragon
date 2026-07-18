@@ -11,6 +11,7 @@ from os import listdir
 from os.path import join as path_join, exists, isfile
 from markdown import render, slug
 from html import HTML
+from assets import CSS_V, JS_V
 import json
 from views.www import topbar, footer
 
@@ -602,7 +603,7 @@ def _render_page(kind: str, slug: str, title: str, username: str, content_html: 
             <title>!{title} - Dragon</title>
             <link rel="icon" type="image/png" href="/assets/dr.png">
             <link rel="apple-touch-icon" href="/assets/dr.png">
-            <link rel="stylesheet" href="/assets/app.css">
+            <link rel="stylesheet" href="/assets/app.css?v=!{CSS_V}">
         </head>
         <body>
             !{topbar_html}
@@ -619,7 +620,7 @@ def _render_page(kind: str, slug: str, title: str, username: str, content_html: 
                 </main>
             </div>
             !{footer_html}
-            <script src="/assets/app.js"></script>
+            <script src="/assets/app.js?v=!{JS_V}"></script>
         </body>
         </html>
     }

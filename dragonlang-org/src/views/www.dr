@@ -13,7 +13,7 @@
 
 from html import HTML
 from highlight import highlight
-
+from assets import CSS_V, JS_V
 
 # --- Release configuration (single source of truth) --------------------------
 #
@@ -173,13 +173,13 @@ def page_shell(title: str, active: str, username: str, body: HTML) -> HTML {
     <title>!{title}</title>
     <link rel="icon" type="image/png" href="/assets/dr.png">
     <link rel="apple-touch-icon" href="/assets/dr.png">
-    <link rel="stylesheet" href="/assets/app.css">
+    <link rel="stylesheet" href="/assets/app.css?v=!{CSS_V}">
 </head>
 <body class="www-body">
     !{top}
     !{body}
     !{foot}
-    <script src="/assets/app.js"></script>
+    <script src="/assets/app.js?v=!{JS_V}"></script>
 </body>
 </html>
     }
