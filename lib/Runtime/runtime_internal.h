@@ -36,7 +36,8 @@
 // calls we use (close, read, write, pipe, getpid). MSVC is not a target.
 #include <pthread.h>
 #include <unistd.h>
-#include <stdatomic.h>
+// Atomics: use __atomic_* builtins only. Do NOT include <stdatomic.h>; it is a
+// C11 header that GCC < 13 rejects in C++ TUs (breaks the ubuntu-22.04 CI).
 
 // minicoro - declarations only (MINICORO_IMPL defined in runtime_concurrency.cpp).
 // MCO_USE_VMEM_ALLOCATOR makes every green-thread stack a virtual-memory
