@@ -1074,6 +1074,16 @@ bool CodeGen::linkExecutable(const std::string& outputFile,
     // when an extern decl references those prefixes) so programs that
     // never touch compression don't link against unused system libs -
     // mirrors the sqlite3 / pcre2 gating pattern.
+#ifdef __APPLE__
+    // Apple clang does not search Homebrew's lib dir on arm64 (/opt/homebrew);
+    // Intel brew's /usr/local/lib it does. libzstd is brew-only on macOS (libz
+    // ships with the OS), so add both prefixes: ld silently ignores absent
+    // dirs, and system paths still win for libs present in both
+    if (impl_->needsZ || impl_->needsZstd) {
+        args.push_back("-L/opt/homebrew/lib");
+        args.push_back("-L/usr/local/lib");
+    }
+#endif
     if (impl_->needsZ) {
         args.push_back("-lz");
     }

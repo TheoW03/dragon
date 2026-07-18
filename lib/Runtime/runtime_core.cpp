@@ -3,6 +3,46 @@
 
 #include "runtime_internal.h"
 
+#ifdef __APPLE__
+// Mach-O has no _end/__executable_start; compute the main image's span once
+// at load time for the dragon_str_is_heap range gate. Defaults cover the whole
+// address space so an uninitialized read fails SAFE: a pointer classifies as
+// "literal in image" (skipped, possibly leaked) rather than being header-probed
+// (the A/B-proven rodata-write SEGV this gate exists to prevent)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <string.h>
+const char* __dragon_image_lo = (const char*)0;
+const char* __dragon_image_hi = (const char*)UINTPTR_MAX;
+__attribute__((constructor))
+static void dragon_image_bounds_init(void) {
+    // Image 0 is always the main executable.
+    const struct mach_header_64* mh =
+        (const struct mach_header_64*)_dyld_get_image_header(0);
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    const struct load_command* lc = (const struct load_command*)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg =
+                (const struct segment_command_64*)lc;
+            // __PAGEZERO is the 4GB reserved null region, not image content.
+            if (strcmp(seg->segname, "__PAGEZERO") != 0) {
+                uintptr_t s = (uintptr_t)seg->vmaddr + (uintptr_t)slide;
+                uintptr_t e = s + (uintptr_t)seg->vmsize;
+                if (s < lo) lo = s;
+                if (e > hi) hi = e;
+            }
+        }
+        lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+    }
+    if (lo < hi) {
+        __dragon_image_lo = (const char*)lo;
+        __dragon_image_hi = (const char*)hi;
+    }
+}
+#endif
+
 extern "C" {
 
 //===----------------------------------------------------------------------===//

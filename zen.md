@@ -2,12 +2,12 @@
 
 Dragon is - the snake that became a Dragon.
 Here, the hot path is sacred.
-If interpreted it is, sacred it is not.
+If interpreted it is, sacred it is not.  --said **Yoda** *arguably*
 
 Fast is better than slow.
 Slow is better than broken.
 You should know if it is broken when you compile.
-Practicality should not be an excuse for poor performance.
+Practicality should never be an excuse for poor performance.
 
 If you are the only one that understands it, it is wrong.
 In the face of ambiguity, annotate.

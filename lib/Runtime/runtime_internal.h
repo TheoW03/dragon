@@ -817,11 +817,27 @@ static inline DragonString* dragon_string_from_data(const char* data) {
     return (DragonString*)((char*)data - offsetof(DragonString, data));
 }
 
-// Linker-provided bounds of the executable image (GNU ld default script;
-// correct under PIE after relocation). Used to range-gate the heap-string
-// probe below.
+// Bounds of the executable image, used to range-gate the heap-string probe
+// below.
+// - ELF (Linux/BSD): linker-provided symbols (GNU ld default script; correct
+//   under PIE after relocation).
+// - Mach-O (macOS): no _end/__executable_start exist. runtime_core.cpp walks
+//   the main image's LC_SEGMENT_64 load commands once at load time (via a
+//   constructor) and publishes the span here. The startup defaults cover the
+//   whole address space, which fails SAFE: until initialized, every pointer
+//   classifies as "in image" (treated as a literal, never probed backwards),
+//   never the reverse.
+#ifdef __APPLE__
+extern const char* __dragon_image_lo;
+extern const char* __dragon_image_hi;
+#define DRAGON_IMAGE_LO (__dragon_image_lo)
+#define DRAGON_IMAGE_HI (__dragon_image_hi)
+#else
 extern char __executable_start[];
 extern char _end[];
+#define DRAGON_IMAGE_LO ((const char*)__executable_start)
+#define DRAGON_IMAGE_HI ((const char*)_end)
+#endif
 
 /// Heap-vs-literal check for a `const char*` string pointer. Borrowed C
 /// literals don't have a DragonObjectHeader; heap DragonStrings do, with
@@ -838,7 +854,7 @@ extern char _end[];
 /// they replace on the literal path
 static inline int dragon_str_is_heap(const char* s) {
     if (!s) return 0;
-    if (s >= (const char*)__executable_start && s < (const char*)_end) return 0;
+    if (s >= DRAGON_IMAGE_LO && s < DRAGON_IMAGE_HI) return 0;
     DragonString* ds = dragon_string_from_data(s);
     return ds->header.type_tag == DRAGON_TAG_STR &&
            (ds->header.gc_flags & GC_FLAG_HEAP_OBJ) ? 1 : 0;
