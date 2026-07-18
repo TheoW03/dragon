@@ -152,6 +152,36 @@ void TypeChecker::visit(CallExpr& node) {
             }
             node.resolvedMethodOverload = chosen;
             auto& chosenFt = static_cast<FunctionType&>(*(*cands)[chosen]);
+            // The chosen overload's parameter types are this call's expected
+            // types: bless fresh container-literal arguments against them,
+            // exactly like the single-callee path does below (empty literals
+            // adopt the param's representation; non-empty ones force the box
+            // representation for Any/union element types, recursively).
+            // Without this, an inline dict/list literal passed to an
+            // OVERLOADED method kept its monomorphized guess - a nested
+            // `["a", "b"]` inside a dict[str, Any] argument compiled as
+            // list[str] and the callee walked the wrong stride reading it.
+            for (size_t ai = 0; ai < node.args.size(); ++ai) {
+                const auto& pt = chosenFt.paramTypes[ai];
+                const auto& at = node.args[ai]->type;
+                if (!pt || !at) continue;
+                auto ak = at->kind(), pk = pt->kind();
+                bool container = ak == Type::Kind::List || ak == Type::Kind::Dict ||
+                                 ak == Type::Kind::Tuple || ak == Type::Kind::Task;
+                if (!container || ak != pk) continue;
+                if (auto* le = dynamic_cast<ListExpr*>(node.args[ai].get())) {
+                    if (le->elements.empty()) {
+                        propagateAnnotationToEmptyLiteral(node.args[ai].get(), pt);
+                        continue;
+                    }
+                } else if (auto* de = dynamic_cast<DictExpr*>(node.args[ai].get())) {
+                    if (de->entries.empty()) {
+                        propagateAnnotationToEmptyLiteral(node.args[ai].get(), pt);
+                        continue;
+                    }
+                }
+                tryExpectedTypeLiteral(node.args[ai].get(), pt);
+            }
             node.type = chosenFt.returnType ? chosenFt.returnType : impl_->anyType;
             return;
         }

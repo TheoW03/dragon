@@ -115,6 +115,30 @@ class CrudTest(TestCase) {
 }
 
 
+class SchemaKeywordTest(TestCase) {
+    # 'default' is spec-decided (section 5) but not implemented yet: accepting
+    # and ignoring it would silently break writers that omit the field and
+    # expect the default back. Loud until it lands, like decimal arithmetic.
+    def test_default_keyword_is_rejected_loudly() -> None {
+        db: ODB = _mem()
+        raised: bool = False
+        try {
+            db.schema("things", { "type": "object",
+                                  "properties": { "a": {"type": "integer", "default": 7} },
+                                  "required": ["a"] })
+        } except SchemaError as e {
+            raised = True
+            self.assertTrue("default" in str(e))
+        }
+        self.assertTrue(raised)
+        # The failed define must leave no residue: the name is free to use.
+        db.schema("things", { "type": "object",
+                              "properties": { "a": {"type": "integer"} },
+                              "required": ["a"] })
+    }
+}
+
+
 class PersistenceTest(TestCase) {
     # Reopen the in-memory disk into a fresh ODB: schema, data, and the docid
     # counter all survive, no real file involved.
@@ -214,4 +238,4 @@ class DbCrashTest(TestCase) {
 }
 
 
-main([CrudTest(), PersistenceTest(), DbCrashTest()])
+main([CrudTest(), SchemaKeywordTest(), PersistenceTest(), DbCrashTest()])

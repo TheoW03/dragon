@@ -198,6 +198,14 @@ def compile_schema(name: str, schema: dict[str, Any], schema_id: int, version: i
             fs.has_maxlen = True
             fs.maxlen = mxl
         }
+        # No schema-side defaults: a field is absent, null, or a value a
+        # writer actually wrote. Accepting the keyword and ignoring it would
+        # be a silent lie (a writer that omits the field expecting the
+        # default back would read absence), so it is refused outright.
+        # Fallbacks are a read-time decision: x ?? fallback.
+        if "default" in sub {
+            raise SchemaError("property '" + nm + "': 'default' is not supported; a field is absent, null, or written - coalesce at read time instead (x ?? fallback)")
+        }
 
         cs.by_name[nm] = fs
         cs.by_id[fid] = fs
