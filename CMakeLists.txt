@@ -177,6 +177,11 @@ target_compile_definitions(dragon_runtime PRIVATE
 # the -lz -lzstd flags in CodeGen::linkExecutable.
 find_package(ZLIB REQUIRED)
 find_library(ZSTD_LIBRARY NAMES zstd libzstd REQUIRED)
+# zstd has no imported target carrying its include dir (unlike ZLIB::ZLIB).
+# On arm64 macOS Homebrew lives at /opt/homebrew, which is NOT on the default
+# header search path, so resolve zstd.h explicitly.
+find_path(ZSTD_INCLUDE_DIR NAMES zstd.h REQUIRED)
+target_include_directories(dragon_runtime PRIVATE ${ZSTD_INCLUDE_DIR})
 target_link_libraries(dragon_runtime PRIVATE ZLIB::ZLIB ${ZSTD_LIBRARY})
 
 # DRAGON_ASAN (see the banner above) - the instrumented runtime twin. Compiled

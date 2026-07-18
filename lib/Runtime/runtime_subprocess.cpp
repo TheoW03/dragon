@@ -379,8 +379,16 @@ static void pump_drain_sigpipe(void) {
         sigset_t only;
         sigemptyset(&only);
         sigaddset(&only, SIGPIPE);
+#ifdef __APPLE__
+        // macOS has no sigtimedwait. sigwait would block on an empty pending
+        // set, but the sigpending check above guarantees SIGPIPE is pending,
+        // so this consumes it and returns immediately
+        int consumed = 0;
+        sigwait(&only, &consumed);
+#else
         struct timespec zero = {0, 0};
         sigtimedwait(&only, NULL, &zero);
+#endif
     }
 }
 
