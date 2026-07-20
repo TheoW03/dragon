@@ -47,6 +47,7 @@ from odb.checker import check_tree, check_index_tree, CheckResult
 from odb.codec import blank, put_u16, put_u32, put_u64, put_bytes
 from odb.codec import get_u16, get_u32, get_u64, get_bytes
 from odb.errors import SchemaError, NotFound, ODBError, IntegrityError, PrepareError, CorruptionError, CaptureSignal
+from odb.errors import NoRows, MultipleRows
 from odb.raftlog import RaftTail
 from json import dumps, loads
 from time import now
@@ -735,17 +736,68 @@ class ODB {
     # extracted parameters, bound positionally through the same value-only
     # injection path as `$name`. Parameters are never spliced into the text.
     def find(query: OQL) -> list[Document] {
+        return self._find_q(self._bind_template(query))
+    }
+
+    # Parse a template[OQL] value and bind its extracted params positionally.
+    def _bind_template(query: OQL) -> OqlQuery {
         q: OqlQuery = parse(query.canonical)
-        binds: dict[str, Any] = {}
-        i: int = 0
-        for v in query.params {
-            binds[str(i)] = v
-            i = i + 1
-        }
-        if i > 0 {
+        binds: dict[str, Any] = self._tpl_binds(query)
+        if len(binds) > 0 {
             bind_query(q, binds)
         }
-        return self._find_q(q)
+        return q
+    }
+
+    #--- Typed reads (spec section 20) -------------------------------------#
+    # Row classes hydrate themselves: T's constructor takes the matched
+    # Document and pulls fields by subscript. The typed verbs accept only
+    # template[OQL] values (a generic method has exactly one signature), so
+    # typed rows always ride the injection-safe parameter path; runtime
+    # strings stay on the untyped find().
+
+    # Every match, hydrated: one T per matching document.
+    def all[T](query: OQL) -> list[T] {
+        docs: list[Document] = self.find(query)
+        out: list[T] = []
+        for d in docs {
+            out.append(T(d))
+        }
+        return out
+    }
+
+    # Exactly one match: zero raises NoRows, two or more raises MultipleRows.
+    def one[T](query: OQL) -> T {
+        docs: list[Document] = self.find(query)
+        if len(docs) == 0 {
+            raise NoRows("OQL: no rows matched")
+        }
+        if len(docs) > 1 {
+            raise MultipleRows(f"OQL: {len(docs)} rows matched, expected exactly one")
+        }
+        return T(docs[0])
+    }
+
+    # A single scalar: exactly one row AND exactly one projected plain field,
+    # e.g. val[int](template[OQL] { customers ? id == !{uid} { age } }).
+    def val[T](query: OQL) -> T {
+        q: OqlQuery = self._bind_template(query)
+        if q.project_all or len(q.fields) != 1 {
+            raise PrepareError("OQL: val needs exactly one projected field, e.g. { age }")
+        }
+        pf: ProjField = q.fields[0]
+        if pf.is_ref {
+            raise PrepareError("OQL: val cannot project a ref")
+        }
+        docs: list[Document] = self._find_q(q)
+        if len(docs) == 0 {
+            raise NoRows("OQL: no rows matched")
+        }
+        if len(docs) > 1 {
+            raise MultipleRows(f"OQL: {len(docs)} rows matched, expected exactly one")
+        }
+        v: T = docs[0][pf.alias]
+        return v
     }
 
     def _find_q(q: OqlQuery) -> list[Document] {
@@ -830,6 +882,13 @@ class ODB {
 
     def run(oql: str, params: dict[str, Any]) -> int {
         return self._run(oql, params)
+    }
+
+    # OQL write from a `template[OQL]` value: canonical `$$N` text plus its
+    # extracted parameters, bound as values (never spliced into the text) -
+    # the injection-safe write form, symmetric with find(OQL).
+    def run(query: OQL) -> int {
+        return self._run(query.canonical, self._tpl_binds(query))
     }
 
     def _run(oql: str, params: dict[str, Any]) -> int {
@@ -1190,6 +1249,28 @@ class ODB {
 
     def watch(query: str, params: dict[str, Any], since: int) -> Watch {
         return self._watch_q(query, params, since)
+    }
+
+    # Watch a template[OQL] query: same injection-safe value binding as
+    # find(OQL), from the current CSN or an explicit resume token.
+    def watch(query: OQL) -> Watch {
+        return self._watch_q(query.canonical, self._tpl_binds(query), self.pager.last_csn)
+    }
+
+    def watch(query: OQL, since: int) -> Watch {
+        return self._watch_q(query.canonical, self._tpl_binds(query), since)
+    }
+
+    # Extract a template[OQL] value's positional params into the $name-shaped
+    # dict the parse/bind path consumes ("0", "1", ...).
+    def _tpl_binds(query: OQL) -> dict[str, Any] {
+        binds: dict[str, Any] = {}
+        i: int = 0
+        for v in query.params {
+            binds[str(i)] = v
+            i = i + 1
+        }
+        return binds
     }
 
     def _watch_q(query: str, params: dict[str, Any], since: int) -> Watch {

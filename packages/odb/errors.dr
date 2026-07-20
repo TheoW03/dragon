@@ -23,6 +23,12 @@ class CorruptionError(ODBError) {}
 # A document or schema that was expected to exist does not.
 class NotFound(ODBError) {}
 
+# one[T] / val[T] (spec section 20): the query matched no rows.
+class NoRows(ODBError) {}
+
+# one[T] / val[T] (spec section 20): the query matched more than one row.
+class MultipleRows(ODBError) {}
+
 # Internal control flow for the HA capture seam (spec section 19 v3b): when a
 # leader captures a write for consensus, _flush() raises this instead of
 # committing, so the statement unwinds through its normal rollback path with

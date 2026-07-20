@@ -15,14 +15,7 @@ from html import HTML
 from highlight import highlight
 from assets import CSS_V, JS_V
 
-# --- Release configuration (single source of truth) --------------------------
-#
-# Point GITHUB_REPO at the public repository (e.g. "dragon-lang/dragon") and
-# set DRAGON_VERSION to the released tag. Every download button on the site
-# then lights up automatically, pointing at the matching GitHub Release asset.
-# While GITHUB_REPO is empty the buttons render as "coming soon" - the page
-# is fully functional before any binary ships, by design.
-const GITHUB_REPO: str = "rayattack/dragon"  # "owner/name"; empty => no public releases yet
+const GITHUB_REPO: str = "rayattack/dragon" 
 const DRAGON_VERSION: str = "0.0.1"      # mirrors include/dragon.h VERSION (pre-release)
 
 # Per-platform switches: flip to true as the release pipeline publishes each
@@ -57,6 +50,37 @@ def _asset_url(asset: str) -> str {
         return ""
     }
     return base + asset
+}
+
+
+def _shields_stars_url() -> str {
+    # shields.io renders GitHub's live star count as a small badge image. It is
+    # the one deliberately off-site asset on the page (a single <img>), which
+    # keeps the star count live without any server-side fetch or client JS.
+    # TODO: Come up with a way to capture intent and thinking without continuing
+    # to litter comments across the code base
+    if len(GITHUB_REPO) == 0 {
+        return ""
+    }
+    return f"https://img.shields.io/github/stars/{GITHUB_REPO}?style=social"
+}
+
+
+# The hero meta line: "MIT Licensed" linking to the license file, plus the live
+# GitHub star badge. Both link back to the public repo.
+def _repo_badges() -> HTML {
+    const repo: str = _repo_url()
+    if len(repo) == 0 {
+        return template[HTML] {  }
+    }
+    const license_url: str = repo + "/blob/main/LICENSE.txt"
+    const stars_url: str = _shields_stars_url()
+    return template[HTML] {
+      <div class="lp-badges">
+        <a class="lp-license" href="!{license_url}">MIT Licensed</a>
+        <a class="lp-stars" href="!{repo}"><img src="!{stars_url}" alt="GitHub stars" height="20"></a>
+      </div>
+    }
 }
 
 
@@ -153,6 +177,7 @@ def footer(username: str) -> HTML {
             !{user_link}
           </nav>
         </div>
+        <p class="footer-legal">Python is a registered trademark of the Python Software Foundation. Dragon is an independent project and is not affiliated with or endorsed by the PSF.</p>
       </footer>
     }
 }
@@ -285,6 +310,7 @@ def render_landing(username: str) -> HTML {
             <a class="btn btn-primary" href="/download">Download</a>
             <a class="btn btn-secondary" href="/docs/0001-foreword">Get Started</a>
           </div>
+          !{_repo_badges()}
           <div class="lp-term"><span class="lp-term-prompt">$</span> dragon run hello.dr</div>
         </section>
         <section class="lp-why">

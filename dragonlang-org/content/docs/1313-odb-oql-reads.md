@@ -6,28 +6,61 @@ in metadata are traversed by just naming them. Punctuation for reads, words
 for writes, and every mistake is a prepare-time error with a position - never
 a wrong result at runtime.
 
-All of these run through `db.find()`, which returns `list[Document]`:
+You write a query as a `template[OQL]` value. Every `!{expr}` inside it is a
+**bound parameter** - injected as a value at prepare time, never spliced into
+the query text - so an injection payload is just a string nobody matches, not
+a query that runs. The typed verbs return your own row classes:
 
 ```dragon
-# no block = the whole document
-rows: list[Document] = db.find("customers ? id == 1")
+class Customer {
+    id: int
+    name: str
+    email: str
+    city: str
 
-# shaped projection: only these fields come back
-rows = db.find("""customers ? city == "Lagos" { name, email }""")
+    def(d: Document) {          # a row pulls its fields from the matched document
+        self.id = d["id"]
+        self.name = d["name"]
+        self.email = d["email"]
+        self.city = d["city"]
+    }
+}
 
-# parameters are $name, injected as VALUES - injection is unrepresentable
-rows = db.find("customers ? city == $c { name }", {"c": "Kano"})
+# all[T]: every match, hydrated into T
+where: str = "Lagos"
+rows: list[Customer] = db.all[Customer](template[OQL] { customers ? city == !{where} })
+print(rows[0].name)
+
+# one[T]: exactly one match, else NoRows / MultipleRows
+uid: int = 1
+c: Customer = db.one[Customer](template[OQL] { customers ? id == !{uid} })
+
+# val[T]: one row, one projected field, returned as the scalar
+age: int = db.val[int](template[OQL] { customers ? id == !{uid} { age } })
 ```
 
-Filters compose with `&`, `|`, `!` and parentheses; comparisons are the usual
-six (`== != < <= > >=`). String matching is glob `~` (case-sensitive `*`/`?`)
-and `~*` (case-insensitive); membership is `in`:
+`one[T]` raises `NoRows` when nothing matched and `MultipleRows` when more than
+one did; `val[T]` additionally requires the projection to name exactly one
+plain field. Try to build a query by string-joining user input and you cannot -
+there is no string to join; the value goes through `!{}` or it is not in the
+query.
+
+## Shapes and filters
+
+A projection block selects fields; no block returns the whole document. Filters
+compose with `&`, `|`, `!` and parentheses; comparisons are the usual six
+(`== != < <= > >=`). String matching is glob `~` (case-sensitive `*`/`?`) and
+`~*` (case-insensitive); membership is `in`:
 
 ```dragon
-db.find("""customers ? name ~ "A*" { name }""")
-db.find("""orders ? status in ["paid", "shipped"]""")
-db.find("""customers ? city == "Lagos" & (vip | missing!(vip))""")
+db.all[Customer](template[OQL] { customers ? name ~ !{pattern} { name } })
+db.find(template[OQL] { orders ? status in ["paid", "shipped"] })
+db.find(template[OQL] { customers ? city == !{c} & (vip | missing!(vip)) })
 ```
+
+`db.find` is the untyped read: it returns `list[Document]` (subscript with
+`row["field"]`) and is what you reach for when the result does not map to a
+single row class - nested reads and aggregates below both use it.
 
 OQL is its own small language, not embedded Dragon: booleans are spelled
 `true` and `false`, and built-in functions take a trailing `!` (`len!`,
@@ -43,7 +76,9 @@ object.
 
 ```dragon
 # each customer with their paid orders nested inside
-rows = db.find("""customers { name, orders ? status == "paid" { id, total } }""")
+status: str = "paid"
+rows: list[Document] = db.find(
+    template[OQL] { customers { name, orders ? status == !{status} { id, total } } })
 n_paid: int = len(rows[0]["orders"])
 ```
 
@@ -53,8 +88,8 @@ existence operators - `+` keeps parents that have a match, `-` keeps parents
 that have none:
 
 ```dragon
-db.find("""customers + (orders ? status == "paid") { name }""")   # with paid orders
-db.find("customers - orders { name }")                          # with no orders at all
+db.find(template[OQL] { customers + (orders ? status == !{status}) { name } })
+db.find(template[OQL] { customers - orders { name } })   # with no orders at all
 ```
 
 ## Aggregates and grouping
@@ -63,10 +98,11 @@ A block of only aggregates summarizes the whole set; `by` groups first and
 reads like English:
 
 ```dragon
-totals: list[Document] = db.find("orders { n: count!(), revenue: sum!(total) }")
+totals: list[Document] = db.find(template[OQL] { orders { n: count!(), revenue: sum!(total) } })
 print(totals[0]["n"], totals[0]["revenue"])
 
-per: list[Document] = db.find("orders by status { status, n: count!(), revenue: sum!(total) }")
+per: list[Document] = db.find(
+    template[OQL] { orders by status { status, n: count!(), revenue: sum!(total) } })
 ```
 
 Available aggregates: `count!()`, `count!(distinct x)`, `sum!`, `avg!`,
@@ -79,8 +115,9 @@ standing on: to summarize a relationship, query from the many side (group
 Stages after the block transform the result set, in order:
 
 ```dragon
+floor: int = 0
 top: list[Document] = db.find(
-    """orders ? status == "paid" { id, total } | sort -total, id | take 10 | skip 0""")
+    template[OQL] { orders ? total > !{floor} { id, total } | sort -total, id | take 10 | skip 0 })
 ```
 
 `sort` is stable, `-field` descends, ties break on `_id`, and absent values
@@ -100,7 +137,7 @@ presence is the question, ask it explicitly with `exists!(x)` /
 almost always want:
 
 ```dragon
-db.find("customers { name, tier: vip ?? false }")
+db.find(template[OQL] { customers { name, tier: vip ?? false } })
 ```
 
 ## Mistakes fail before they run
@@ -113,17 +150,33 @@ field, a type-mismatched comparison, an aggregate outside a block - all are
 from odb.errors import PrepareError
 
 try {
-    db.find("customers ? age == 3")        # no such field
+    db.find(template[OQL] { customers ? age == 3 })        # no such field
 } except PrepareError as e {
     print(e)
 }
 try {
-    db.find("customers ? id == \"x\"")     # int compared to a string
+    db.find(template[OQL] { customers ? id == "x" })       # int compared to a string
 } except PrepareError as e {
     print(e)
 }
 ```
 
-Plans are cached by query text, so the prepare cost is paid once per distinct
-query, not once per call.
+Plans are cached by the query's canonical text, so the prepare cost is paid
+once per distinct query, not once per call - and two calls that differ only in
+their `!{}` values share the one cached plan.
 
+## When the query text is dynamic
+
+Sometimes the query itself is data: an admin shell, a saved-query field, a
+report builder. For those, `find` and `run` also accept plain text with
+`$name` parameters, injected as values exactly like `!{}`:
+
+```dragon
+q: str = load_saved_query()                         # text decided at runtime
+rows: list[Document] = db.find(q, {"c": "Kano"})    # $c inside q is a bound value
+```
+
+Reach for this only when the query text is genuinely not known at compile
+time. When you are writing the query, write it as `template[OQL]`: the
+compiler interns it, the parameters are values by construction, and the rows
+come back typed.

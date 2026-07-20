@@ -27,9 +27,10 @@ projection:
 ```dragon
 from odb import Watch, Change
 
-w: Watch = db.watch("""orders ? status == "paid" { id, total }""")
+status: str = "paid"
+w: Watch = db.watch(template[OQL] { orders ? status == !{status} { id, total } })
 
-db.run("""add orders { id: 30, customer_id: 4, status: "paid", total: 60 }""")
+db.run(template[OQL] { add orders { id: 30, customer_id: 4, status: "paid", total: 60 } })
 
 hits: list[Change] = w.poll()
 print(hits[0].kind)              # "add"
@@ -54,10 +55,13 @@ is natural:
 
 ```dragon
 at: int = db.csn()
-db.run("set customers ? id == 4 { city: \"Enugu\" }")
+db.run(template[OQL] { set customers ? id == 4 { city: "Enugu" } })
 
-then: list[Document] = db.find(f"customers@csn({at}) ? id == 4 {{ city }}")
-now_: list[Document] = db.find("customers ? id == 4 { city }")
+# @csn(N) is a structural coordinate - which snapshot - not a value, so it is
+# named directly in the source from the trusted CSN db.csn() handed you. Any
+# value filter in a time-travel read still binds through !{} or $name.
+then: list[Document] = db.find("customers@csn(" + str(at) + ") ? id == 4 { city }")
+now_: list[Document] = db.find(template[OQL] { customers ? id == 4 { city } })
 print(then[0]["city"], "->", now_[0]["city"])    # Lagos -> Enugu
 ```
 
@@ -91,6 +95,3 @@ And whenever you want proof, not vibes:
 ```dragon
 print(db.check().ok)             # structure, indexes, refs - one pass
 ```
-
-
-

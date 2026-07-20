@@ -829,6 +829,24 @@ article table code {
     justify-content: center;
     flex-wrap: wrap;
 }
+.lp-badges {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 18px;
+}
+.lp-license {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg-muted);
+    border: 1px solid var(--border-hard);
+    border-radius: 999px;
+    padding: 3px 12px;
+}
+.lp-license:hover { color: var(--fg); text-decoration: none; }
+.lp-stars { display: inline-flex; align-items: center; }
+.lp-stars img { display: block; }
 .lp-term {
     display: inline-block;
     margin-top: 26px;
@@ -1014,6 +1032,15 @@ article table code {
 .footer-links { margin-left: auto; display: flex; gap: 18px; flex-wrap: wrap; }
 .footer-links a { color: var(--fg-muted); }
 .footer-links a:hover { color: var(--link); }
+.footer-legal {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 0 24px 24px 24px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--fg-muted);
+    opacity: 0.8;
+}
 
 /* ---------- benchmarks (landing teaser + /benchmarks page) ---------- */
 
