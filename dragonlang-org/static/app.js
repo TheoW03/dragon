@@ -131,6 +131,66 @@
     } catch (_) {}
 })();
 
+// Download page: clipboard-copy on the install command, plus the macOS
+// "Install via curl" button that scrolls to the command box and pulses it.
+// The trigger is a real #dl-quick anchor, and the copy button falls back to
+// execCommand where the async clipboard API is absent
+(function () {
+    var box = document.querySelector('.dl-quick');
+    if (!box) return;
+    var cmd = box.querySelector('.dl-cmd');
+
+    function fallbackCopy(text, done) {
+        try {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'absolute';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            done();
+        } catch (_) {}
+    }
+
+    var copyBtn = box.querySelector('.dl-copy');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', function () {
+            var target = document.getElementById(copyBtn.getAttribute('data-copy'));
+            var text = target ? target.textContent : '';
+            var done = function () {
+                copyBtn.classList.add('copied');
+                copyBtn.setAttribute('title', 'Copied');
+                setTimeout(function () {
+                    copyBtn.classList.remove('copied');
+                    copyBtn.setAttribute('title', 'Copy');
+                }, 1600);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+            } else {
+                fallbackCopy(text, done);
+            }
+        });
+    }
+
+    function glow() {
+        if (!cmd) return;
+        cmd.classList.remove('dl-glow');
+        void cmd.offsetWidth;   // reflow so the animation restarts on repeat clicks
+        cmd.classList.add('dl-glow');
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('.dl-curl-trigger'), function (btn) {
+        btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            try { box.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) { box.scrollIntoView(); }
+            glow();
+        });
+    });
+})();
+
 // Docs search. A single input in the sidebar; the index (titles + every
 // in-page heading, each with an anchor URL and a preview) is fetched once from
 // /docs/search-index.json on first use and filtered entirely client-side, so

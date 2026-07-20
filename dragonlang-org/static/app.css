@@ -917,6 +917,66 @@ article table code {
 .dl-head h1 { font-size: 40px; border: 0; margin: 0; padding: 0; }
 .dl-ver { color: var(--fg-muted); margin: 10px 0 0 0; }
 
+.dl-quick { text-align: center; margin: 30px auto 0 auto; max-width: 720px; }
+.dl-quick h2 { font-size: 20px; font-weight: 700; border: 0; margin: 0 0 14px 0; }
+.dl-cmd {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 620px;
+    margin: 0 auto;
+    padding: 12px 12px 12px 18px;
+    border-radius: 10px;
+    background: var(--bg-codeblock);
+    border: 1px solid var(--border-codeblock);
+    box-shadow: 0 0 0 0 transparent;
+}
+.dl-cmd-prompt { color: var(--tok-prompt); user-select: none; flex: 0 0 auto; }
+.dl-cmd code {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    text-align: left;
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 15px;
+    color: var(--fg-codeblock);
+    white-space: nowrap;
+    background: none;
+    padding: 0;
+}
+/* Clipboard button: two stacked icons, clip by default, tick when copied */
+.dl-copy {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border-hard);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+}
+.dl-copy:hover { color: var(--fg); border-color: var(--fg-muted); }
+.dl-copy .dl-copy-tick { display: none; }
+.dl-copy.copied { color: #22c55e; border-color: #22c55e; }
+.dl-copy.copied .dl-copy-clip { display: none; }
+.dl-copy.copied .dl-copy-tick { display: inline; }
+/* Glow pulse when the macOS "Install via curl" button points here */
+.dl-cmd.dl-glow {
+    animation: dl-glow-pulse 1.6s ease-out 1;
+    border-color: var(--link);
+}
+@keyframes dl-glow-pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--link) 65%, transparent); }
+    70%  { box-shadow: 0 0 0 10px color-mix(in srgb, var(--link) 0%, transparent); }
+    100% { box-shadow: 0 0 0 0 transparent; }
+}
+.dl-quick-note { color: var(--fg-muted); font-size: 14px; margin: 14px auto 0 auto; max-width: 620px; }
+
 .dl-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);

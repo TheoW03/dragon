@@ -448,8 +448,10 @@ if(UNIX AND NOT APPLE)
     set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
         "/usr/share" "/usr/share/man" "/usr/include")
 elseif(APPLE)
-    set(CPACK_GENERATOR "DragNDrop;TGZ")
-    set(CPACK_DMG_VOLUME_NAME "Dragon ${PROJECT_VERSION}")
+    # No .dmg: macOS installs go through the curl install script (install.sh),
+    # which avoids the Gatekeeper quarantine an unsigned disk image would carry.
+    # The .tar.gz is what the script downloads and what manual installers use.
+    set(CPACK_GENERATOR "TGZ")
     set(CPACK_SYSTEM_NAME "Darwin")
 elseif(WIN32)
     # MSI via the WiX toolset (requires WiX on the build machine / CI runner).
@@ -461,6 +463,11 @@ elseif(WIN32)
     set(CPACK_WIX_PROGRAM_MENU_FOLDER "Dragon")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "Dragon")
 endif()
+
+# Per-generator overrides, evaluated once per generator with CPACK_GENERATOR set.
+# Keeps /usr for the .deb/.rpm (system packages need it) while giving the .tar.gz
+# a clean bin/lib/share/include root on every platform. See cmake/CPackOptions.cmake.
+set(CPACK_PROJECT_CONFIG_FILE "${CMAKE_SOURCE_DIR}/cmake/CPackOptions.cmake")
 
 include(CPack)
 

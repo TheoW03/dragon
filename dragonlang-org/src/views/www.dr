@@ -397,11 +397,14 @@ def render_download(ua: str, username: str) -> HTML {
       !{_dl_btn(".rpm (Fedora / RHEL)", "dragon-" + DRAGON_VERSION + "-linux-x86_64.rpm", false, LINUX_LIVE)}
       !{_dl_btn(".tar.gz (portable)", "dragon-" + DRAGON_VERSION + "-linux-x86_64.tar.gz", false, LINUX_LIVE)}
     }
-    # macOS: Apple Silicon .dmg primary; Intel .dmg + tarball secondary.
+    # macOS: the primary action is "Install via curl", which points at (and
+    # spotlights) the command box above - no .dmg, so no Gatekeeper quarantine.
+    # The portable tarballs stay as the manual alternative for Apple Silicon and
+    # Intel. The curl trigger is macOS-only by living in this card's buttons.
     const mac: HTML = template[HTML] {
-      !{_dl_btn("Download .dmg (Apple Silicon)", "dragon-" + DRAGON_VERSION + "-macos-arm64.dmg", true, MACOS_LIVE)}
-      !{_dl_btn(".dmg (Intel)", "dragon-" + DRAGON_VERSION + "-macos-x86_64.dmg", false, MACOS_LIVE)}
-      !{_dl_btn(".tar.gz (portable)", "dragon-" + DRAGON_VERSION + "-macos-arm64.tar.gz", false, MACOS_LIVE)}
+      <a class="dl-btn dl-btn-primary dl-curl-trigger" href="#dl-quick">Install via curl</a>
+      !{_dl_btn(".tar.gz (Apple Silicon)", "dragon-" + DRAGON_VERSION + "-macos-arm64.tar.gz", false, MACOS_LIVE)}
+      !{_dl_btn(".tar.gz (Intel)", "dragon-" + DRAGON_VERSION + "-macos-x86_64.tar.gz", false, MACOS_LIVE)}
     }
     # Windows: .msi installer primary; portable .zip secondary.
     const win: HTML = template[HTML] {
@@ -426,9 +429,24 @@ def render_download(ua: str, username: str) -> HTML {
           <h1>Download Dragon</h1>
           <p class="dl-ver">Current version <strong>!{DRAGON_VERSION}</strong></p>
         </section>
+        <section class="dl-quick" id="dl-quick">
+          <h2>Quick install &middot; macOS and Linux</h2>
+          <div class="dl-cmd">
+            <span class="dl-cmd-prompt">$</span>
+            <code id="dl-cmd-text">curl -fsSL https://dragonlang.org/install.sh | sh</code>
+            <button type="button" class="dl-copy" data-copy="dl-cmd-text" aria-label="Copy command to clipboard" title="Copy">
+              <svg class="dl-copy-clip" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <svg class="dl-copy-tick" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </button>
+          </div>
+          <p class="dl-quick-note">
+            Detects your OS and CPU, downloads the matching build, and installs it under <code>/usr/local</code>.
+            Read the script first at <a href="/install.sh">dragonlang.org/install.sh</a>.
+          </p>
+        </section>
         <div class="dl-grid">
           !{_dl_card("linux", "Linux", "/assets/linux.svg", os_guess == "linux", soon or not LINUX_LIVE, lin, "x86-64. Bundles the stdlib; needs a C compiler (gcc/clang) on PATH for linking.")}
-          !{_dl_card("macos", "macOS", "/assets/apple.svg", os_guess == "macos", soon or not MACOS_LIVE, mac, "Universal builds for Apple Silicon and Intel. Requires the Xcode command-line tools.")}
+          !{_dl_card("macos", "macOS", "/assets/apple.svg", os_guess == "macos", soon or not MACOS_LIVE, mac, "Apple Silicon and Intel. The install script above is the easy path; these tarballs are for manual installs. Requires the Xcode command-line tools.")}
           !{_dl_card("windows", "Windows", "/assets/microsoft.svg", os_guess == "windows", soon or not WINDOWS_LIVE, win, "x86-64 MSI. Adds dragon to PATH; needs a C compiler (MSVC or clang) for linking.")}
         </div>
         <section class="dl-source">

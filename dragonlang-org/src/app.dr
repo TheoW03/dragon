@@ -8,6 +8,7 @@
 # their route registrations here and their render modules under src/).
 
 from http.server import Router, Request, Response, Context
+from io import open
 from deps import SECRET
 from controllers.eggs.web import login_page, login_submit, signup_page, signup_submit, confirm_email, logout, account_page, token_create, token_revoke, index_page, search_page, detail_page
 from controllers.eggs.api import api_publish, api_download, api_search, api_yank, api_eggs, api_fetch, api_log_checkpoint, api_log, api_log_pubkey, api_log_inclusion, api_log_consistency
@@ -47,6 +48,22 @@ def benchmarks(req: Request, res: Response, ctx: Context) -> None {
     res.html(render_benchmarks(req.session.get("uname", "")))
 }
 
+# The install script is read once at startup (cwd = dragonlang-org/, same as
+# static assets). Served as text/plain so `curl | sh` works and a curious user
+# can open https://dragonlang.org/install.sh in a browser to read it first.
+def _read_install_script() -> str {
+    try {
+        return open("static/install.sh").text()
+    } except Exception {
+        return "#!/bin/sh\necho 'dragon: install script unavailable' >&2\nexit 1\n"
+    }
+}
+const INSTALL_SH: str = _read_install_script()
+
+def install_script(req: Request, res: Response, ctx: Context) -> None {
+    res.text(INSTALL_SH)
+}
+
 const app: Router = Router(PORT, HOST)
 
 # Signed-cookie sessions (no server-side store). CSRF on forms is handled
@@ -59,6 +76,7 @@ app.ASSETS("static", "/assets/*")
 # Site (marketing + docs book)
 app.GET('/', landing)
 app.GET('/download', download)
+app.GET('/install.sh', install_script)
 app.GET('/benchmarks', benchmarks)
 app.GET('/docs', docs_redirect)
 # Static route before the :slug param route so it isn't swallowed as a slug.

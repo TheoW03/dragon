@@ -128,8 +128,9 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: build
         run: |
-          cpack -G DragNDrop -B "$PWD/dist"
-          cpack -G TGZ       -B "$PWD/dist"
+          # No .dmg: macOS installs go through install.sh (curl), which avoids
+          # the Gatekeeper quarantine an unsigned disk image would carry.
+          cpack -G TGZ -B "$PWD/dist"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -160,7 +161,7 @@ jobs:
           }
           case "$T" in
             linux-*)   pick deb deb;    pick rpm rpm;    pick "tar.gz" "tar.gz" ;;
-            macos-*)   pick dmg dmg;                     pick "tar.gz" "tar.gz" ;;
+            macos-*)                                     pick "tar.gz" "tar.gz" ;;
             windows-*) pick msi msi;                     pick zip zip ;;
           esac
           # Checksums alongside each artifact.
