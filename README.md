@@ -23,9 +23,7 @@ print(f"fib(32) = {fib(32)}")
 
 ```sh
 # Linux x86-64 (.deb; .rpm and a portable .tar.gz are on the releases page)
-curl -LO https://github.com/rayattack/dragon/releases/download/v0.0.1/dragon-0.0.1-linux-x86_64.deb
-sudo apt install ./dragon-0.0.1-linux-x86_64.deb
-
+curl -fsSL https://dragonlang.org/install.sh | sh
 
 dragon run hello.dr          # compile and run:  fib(32) = 2178309
 dragon build hello.dr -o fib # or keep the binary
